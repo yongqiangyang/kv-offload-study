@@ -1,0 +1,233 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+ * MemFabric_Hybrid is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ *          http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+ * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+*/
+
+#ifndef MEM_FABRIC_HYBRID_HYBM_EX_INFO_TRANSFER_H
+#define MEM_FABRIC_HYBRID_HYBM_EX_INFO_TRANSFER_H
+
+#include <cstring>
+#include <string>
+#include <type_traits>
+#include <algorithm>
+#include <vector>
+#include "hybm_def.h"
+#include "hybm_logger.h"
+
+namespace ock {
+namespace mf {
+template<class DataType>
+class ExInfoTranslator {
+public:
+    virtual int Serialize(const DataType &d, std::string &info) noexcept = 0;
+    virtual int Deserialize(const std::string &info, DataType &d) noexcept = 0;
+};
+
+template<class DataType>
+class LiteralExInfoTranslater : public ExInfoTranslator<DataType> {
+public:
+    int Serialize(const DataType &d, std::string &info) noexcept override
+    {
+        if (!std::is_literal_type<DataType>::value) {
+            return -1;
+        }
+
+        BM_LOG_DEBUG("serialize data length = " << sizeof(DataType));
+        info = std::string(reinterpret_cast<const char *>(&d), sizeof(DataType));
+        return 0;
+    }
+
+    int Deserialize(const std::string &info, DataType &d) noexcept override
+    {
+        if (!std::is_literal_type<DataType>::value) {
+            return -1;
+        }
+
+        if (info.length() != sizeof(DataType)) {
+            BM_LOG_ERROR("deserialize info len: " << info.length() << " not matches data type: " << sizeof(DataType));
+            return -1;
+        }
+
+        std::copy_n(info.data(), sizeof(DataType), reinterpret_cast<uint8_t *>(&d));
+        return 0;
+    }
+};
+
+class ExchangeInfoReader {
+public:
+    explicit ExchangeInfoReader(const hybm_exchange_info *info = nullptr) noexcept : exchangeInfo_{info}, readOffset_{0}
+    {}
+
+    void Reset(const hybm_exchange_info *info = nullptr) noexcept
+    {
+        if (info != nullptr) {
+            exchangeInfo_ = info;
+        }
+        readOffset_ = 0;
+    }
+
+    inline int Test(void *buffer, size_t length) const noexcept
+    {
+        BM_ASSERT_LOG_AND_RETURN(exchangeInfo_ != nullptr, "exchangeInfo_ is nullptr", -1);
+        if (readOffset_ + length > exchangeInfo_->descLen) {
+            BM_LOG_ERROR("read data size: " << length << " too long");
+            return -1;
+        }
+
+        try {
+            std::copy_n(exchangeInfo_->desc + readOffset_, length, (uint8_t *)buffer);
+        } catch (...) {
+            BM_LOG_ERROR("copy failed.");
+            return -1;
+        }
+        return 0;
+    }
+
+    inline int Read(void *buffer, size_t length) const noexcept
+    {
+        BM_ASSERT_LOG_AND_RETURN(exchangeInfo_ != nullptr, "exchangeInfo_ is nullptr", -1);
+        if (readOffset_ + length > exchangeInfo_->descLen) {
+            BM_LOG_ERROR("read data size: " << length << " too long , readOffset_ : " << readOffset_
+                                            << ", descLen :" << exchangeInfo_->descLen);
+            return -1;
+        }
+
+        try {
+            std::copy_n(exchangeInfo_->desc + readOffset_, length, (uint8_t *)buffer);
+        } catch (...) {
+            BM_LOG_ERROR("copy failed.");
+            return -1;
+        }
+        readOffset_ += length;
+        return 0;
+    }
+
+    inline size_t LeftBytes() const noexcept
+    {
+        BM_ASSERT_LOG_AND_RETURN(exchangeInfo_ != nullptr, "exchangeInfo_ is nullptr", 0);
+        if (readOffset_ >= exchangeInfo_->descLen) {
+            return 0U;
+        }
+
+        return exchangeInfo_->descLen - readOffset_;
+    }
+
+    std::string LeftToString() const noexcept
+    {
+        BM_ASSERT_LOG_AND_RETURN(exchangeInfo_ != nullptr, "exchangeInfo_ is nullptr", "");
+        if (readOffset_ >= exchangeInfo_->descLen) {
+            return "";
+        }
+
+        std::string left(exchangeInfo_->desc + readOffset_, exchangeInfo_->desc + exchangeInfo_->descLen);
+        readOffset_ = exchangeInfo_->descLen;
+        return left;
+    }
+
+    template<typename DataType>
+    inline int Test(DataType &data) const noexcept
+    {
+        return Test(static_cast<void *>(&data), sizeof(data));
+    }
+
+    template<typename DataType>
+    inline int Read(DataType &data) const noexcept
+    {
+        return Read(static_cast<void *>(&data), sizeof(data));
+    }
+
+    template<typename ElementType>
+    inline int Read(std::vector<ElementType> &items, size_t maxItems) const noexcept
+    {
+        uint32_t count = 0;
+        int ret = Read(count);
+        if (ret != 0) {
+            return ret;
+        }
+        if (count > maxItems) {
+            BM_LOG_ERROR("read vector count: " << count << " exceeds max: " << maxItems);
+            return -1;
+        }
+        items.assign(count, ElementType{});
+        if (count == 0U) {
+            return 0;
+        }
+        return Read(static_cast<void *>(items.data()), count * sizeof(ElementType));
+    }
+
+private:
+    const hybm_exchange_info *exchangeInfo_;
+    mutable uint32_t readOffset_;
+};
+
+class ExchangeInfoWriter {
+public:
+    explicit ExchangeInfoWriter(hybm_exchange_info *info) noexcept : exchangeInfo_{info}
+    {
+        if (exchangeInfo_ != nullptr) {
+            exchangeInfo_->desc = nullptr;
+            exchangeInfo_->descLen = 0;
+        }
+    }
+
+    ExchangeInfoWriter(const ExchangeInfoWriter &) = delete;
+    ExchangeInfoWriter &operator=(const ExchangeInfoWriter &) = delete;
+
+    inline int Append(const void *data, size_t length) noexcept
+    {
+        BM_ASSERT_LOG_AND_RETURN(exchangeInfo_ != nullptr, "exchangeInfo_ is nullptr", -1);
+        if (length > UINT32_MAX - exchangeInfo_->descLen) {
+            BM_LOG_ERROR("write data size: " << length << " too long");
+            return -1;
+        }
+        try {
+            uint32_t newLen = exchangeInfo_->descLen + length;
+            auto *newData = new (std::nothrow) uint8_t[newLen];
+            if (newData == nullptr) {
+                BM_LOG_ERROR("alloc desc buffer failed, newLen: " << newLen << "curLen: " << exchangeInfo_->descLen);
+                return -1;
+            }
+            if (exchangeInfo_->desc != nullptr && exchangeInfo_->descLen > 0) {
+                std::copy_n(exchangeInfo_->desc, exchangeInfo_->descLen, newData);
+            }
+            std::copy_n(reinterpret_cast<const uint8_t *>(data), length, newData + exchangeInfo_->descLen);
+            delete[] exchangeInfo_->desc;
+            exchangeInfo_->desc = newData;
+            exchangeInfo_->descLen = newLen;
+        } catch (...) {
+            BM_LOG_ERROR("copy failed.");
+            return -1;
+        }
+        return 0;
+    }
+
+    template<class DataType>
+    inline int Append(const DataType &data) noexcept
+    {
+        return Append(reinterpret_cast<const void *>(&data), sizeof(data));
+    }
+
+    template<class ElementType>
+    inline int Append(const std::vector<ElementType> &items) noexcept
+    {
+        auto count = static_cast<uint32_t>(items.size());
+        int ret = Append(count);
+        if (ret != 0 || count == 0U) {
+            return ret;
+        }
+        return Append(reinterpret_cast<const void *>(items.data()), count * sizeof(ElementType));
+    }
+
+private:
+    hybm_exchange_info *exchangeInfo_;
+};
+} // namespace mf
+} // namespace ock
+#endif // MEM_FABRIC_HYBRID_HYBM_EX_INFO_TRANSFER_H

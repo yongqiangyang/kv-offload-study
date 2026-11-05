@@ -1,0 +1,290 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * ZBAL is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ *          http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+ * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+ */
+#include "zbal_npu_communicator_aicpu.h"
+#include "zbal_npu_aicpu_launcher.h"
+#include "zbal_comm_host_device_struct.h"
+#include "zbal_comm_alg_selector.h"
+#include "zbal_mem_allocator.h"
+#include "dl_cann_api.h"
+#include "zbal_init_state.h"
+
+#include <cstdlib>
+
+namespace zbal {
+namespace operators {
+
+using namespace underapi;
+
+static std::string GetAicpuKernelPath()
+{
+    const char *envPath = std::getenv("ZBAL_AICPU_KERNEL_PATH");
+    if (envPath != nullptr && envPath[0] != '\0') {
+        return std::string(envPath);
+    }
+
+    const char *ascendPath = std::getenv("ASCEND_HOME_PATH");
+    if (ascendPath != nullptr && ascendPath[0] != '\0') {
+        return std::string(ascendPath) + "/opp/vendors/cust/aicpu/config/libzbal_aicpu_kernel.json";
+    }
+
+    return "libzbal_aicpu_kernel.json";
+}
+
+/* Workspace layout — see device-side zbal_aicpu_defines.h for full derivation */
+/* Total workspace includes per-core SQE ring buffers for all 4 AICPU cores */
+ZResult NpuCommunicatorAICPU::AllocateAicpuResources()
+{
+    /* Allocate workspace (~420KB for channel info + init context + debug buffer + per-core SQE rings) */
+    ZResult ret = underapi::DlCannApi::AclrtMalloc(&aicpuWorkspacePtr_, ZBAL_AICPU_WORKSPACE_TOTAL_SIZE, 0);
+    if (ret != Z_OK) {
+        ZBAL_LOG_ERROR("Failed to allocate AICPU workspace, size=" << ZBAL_AICPU_WORKSPACE_TOTAL_SIZE);
+        return ret;
+    }
+
+    ret = underapi::DlCannApi::AclrtMemset(aicpuWorkspacePtr_, ZBAL_AICPU_WORKSPACE_TOTAL_SIZE, 0,
+                                           ZBAL_AICPU_WORKSPACE_TOTAL_SIZE);
+    if (ret != Z_OK) {
+        ZBAL_LOG_ERROR("Failed to zero AICPU workspace");
+        underapi::DlCannApi::AclrtFree(aicpuWorkspacePtr_);
+        aicpuWorkspacePtr_ = nullptr;
+        return ret;
+    }
+
+    ZBAL_LOG_INFO("Allocated AICPU workspace: ptr=0x" << std::hex << reinterpret_cast<uintptr_t>(aicpuWorkspacePtr_)
+                                                      << ", size=" << std::dec << ZBAL_AICPU_WORKSPACE_TOTAL_SIZE);
+    return Z_OK;
+}
+
+ZResult NpuCommunicatorAICPU::Initialize() noexcept
+{
+    if (initialized_) {
+        return Z_OK;
+    }
+
+    ZResult ret = NpuCommunicatorBase::Initialize();
+    if (ret != Z_OK) {
+        return ret;
+    }
+
+    ret = AllocateAicpuResources();
+    if (ret != Z_OK) {
+        return ret;
+    }
+
+    std::string kernelPath = GetAicpuKernelPath();
+
+    ret = launcher_.Init(kernelPath, reinterpret_cast<uint64_t>(aicpuWorkspacePtr_), groupInfo_);
+    if (ret != Z_OK) {
+        return ret;
+    }
+
+    initialized_ = true;
+    return Z_OK;
+}
+
+void NpuCommunicatorAICPU::UnInitialize() noexcept
+{
+    launcher_.Finalize();
+    launcher_.Destroy();
+
+    if (aicpuWorkspacePtr_ != nullptr) {
+        underapi::DlCannApi::AclrtFree(aicpuWorkspacePtr_);
+        aicpuWorkspacePtr_ = nullptr;
+    }
+
+    if (reduceScatterCclBuf_ != nullptr) {
+        zbal_pluggable_free(reduceScatterCclBuf_, reduceScatterCclBufSize_, reduceScatterCclBufDevice_, nullptr);
+        reduceScatterCclBuf_ = nullptr;
+        reduceScatterCclBufSize_ = 0;
+        reduceScatterCclBufDevice_ = -1;
+    }
+
+    NpuCommunicatorBase::UnInitialize();
+}
+
+/* Helper: Build AicpuWorkDesc and launch kernel.
+ * count is in ELEMENTS and auto-converted to bytes via dataType. */
+static int32_t LaunchAicpuOp(NpuAicpuLauncher &launcher, uint32_t commType, uint64_t sendBuf, uint64_t recvBuf,
+                             uint64_t count, uint32_t dataType, uint32_t root, const char *opName,
+                             void *stream = nullptr, uint32_t commAlg = 0, uint32_t reduceOp = 0, uint64_t buffer = 0,
+                             uint64_t reserved0 = 0, uint64_t reserved1 = 0, uint64_t reserved2 = 0)
+{
+    AicpuWorkDesc desc{};
+    desc.commType = commType;
+    desc.commAlg = commAlg;
+    desc.sendBuffer = sendBuf;
+    desc.recvBuffer = recvBuf;
+    desc.buffer = buffer;
+    desc.count = count * ZBALDataTypeSize(dataType); /* elements → bytes */
+    desc.dataType = dataType;
+    desc.root = root;
+    desc.reduceOp = reduceOp;
+    desc.reserved[0] = reserved0;
+    desc.reserved[1] = reserved1;
+    desc.reserved[2] = reserved2;
+
+    ZResult zret = launcher.Launch(desc, stream);
+    if (zret != Z_OK) {
+        (void)launcher.SyncAndDumpDebug(stream);
+        ZBAL_LOG_ERROR(opName << " Launch failed, ret=" << static_cast<int32_t>(zret));
+        return 1;
+    }
+    return 0;
+}
+
+int32_t NpuCommunicatorAICPU::AllGather(const void *sendBuff, void *recvBuff, size_t sendCount,
+                                        zbal_datatype_t dataType, aclrtStream stream) noexcept
+{
+    return LaunchAicpuOp(launcher_, ZBAL_CMD_ALLGATHER, reinterpret_cast<uint64_t>(sendBuff),
+                         reinterpret_cast<uint64_t>(recvBuff), sendCount, static_cast<uint32_t>(dataType), 0,
+                         "AllGather", stream);
+}
+
+int32_t NpuCommunicatorAICPU::AllReduce(const void *sendBuff, void *recvBuff, void *buffer, size_t count,
+                                        zbal_datatype_t dataType, zbal_reduce_op_t reduceOp,
+                                        aclrtStream stream) noexcept
+{
+    return LaunchAicpuOp(launcher_, ZBAL_CMD_ALLREDUCE, reinterpret_cast<uint64_t>(sendBuff),
+                         reinterpret_cast<uint64_t>(recvBuff), count, static_cast<uint32_t>(dataType), 0, "AllReduce",
+                         stream, 0, static_cast<uint32_t>(reduceOp), reinterpret_cast<uint64_t>(buffer));
+}
+
+int32_t NpuCommunicatorAICPU::ReduceScatter(const void *sendBuff, void *recvBuff, size_t recvCount,
+                                            zbal_datatype_t dataType, zbal_reduce_op_t reduceOp,
+                                            aclrtStream stream) noexcept
+{
+    uint64_t totalCount = static_cast<uint64_t>(recvCount) * GetMetaInfo().groupSize;
+    uint64_t totalBytes = totalCount * ZBALDataTypeSize(static_cast<uint32_t>(dataType));
+
+    /* DOUBLE_RING needs a cclBuf (256M forwarding scratch), allocated lazily and
+     * freed in UnInitialize. Must use zbal_pluggable_malloc (SMA/GVA symmetric
+     * memory) — peers access cclBuf GVA via cross-device SDMA. AclrtMalloc allocates
+     * plain device memory outside GVA space → peers get invalid addresses → data
+     * corruption. Size must match ZBAL_RS_CCL_BUFFER_BYTES in doublering header. */
+    uint64_t bufferGva = 0;
+    if (totalBytes > ZBAL_AICPU_REDUCESCATTER_DOUBLE_RING_THRESHOLD) {
+        if (reduceScatterCclBuf_ == nullptr) {
+            constexpr uint64_t ZBAL_RS_CCL_BUFFER_BYTES = 256ULL * 1024ULL * 1024ULL;
+            int32_t deviceId = 0;
+            if (underapi::DlCannApi::AclrtGetDevice(&deviceId) != 0) {
+                ZBAL_LOG_ERROR("Failed to get device id for ReduceScatter cclBuf allocation");
+                return Z_ERROR;
+            }
+            reduceScatterCclBuf_ = zbal_pluggable_malloc(ZBAL_RS_CCL_BUFFER_BYTES, deviceId, stream);
+            if (reduceScatterCclBuf_ == nullptr) {
+                ZBAL_LOG_ERROR("Failed to allocate ReduceScatter cclBuf (GVA), size=" << ZBAL_RS_CCL_BUFFER_BYTES);
+                return Z_ERROR;
+            }
+            reduceScatterCclBufSize_ = ZBAL_RS_CCL_BUFFER_BYTES;
+            reduceScatterCclBufDevice_ = deviceId;
+        }
+        bufferGva = reinterpret_cast<uint64_t>(reduceScatterCclBuf_);
+    }
+
+    return LaunchAicpuOp(launcher_, ZBAL_CMD_REDUCE_SCATTER, reinterpret_cast<uint64_t>(sendBuff),
+                         reinterpret_cast<uint64_t>(recvBuff), totalCount, static_cast<uint32_t>(dataType), 0,
+                         "ReduceScatter", stream, 0, static_cast<uint32_t>(reduceOp), bufferGva);
+}
+
+int32_t NpuCommunicatorAICPU::Scatter(const void *sendBuff, void *recvBuff, uint64_t dataCount,
+                                      zbal_datatype_t dataType, uint16_t root, aclrtStream stream) noexcept
+{
+    return LaunchAicpuOp(launcher_, ZBAL_CMD_SCATTER, reinterpret_cast<uint64_t>(sendBuff),
+                         reinterpret_cast<uint64_t>(recvBuff), dataCount, static_cast<uint32_t>(dataType),
+                         static_cast<uint32_t>(root), "Scatter", stream);
+}
+
+int32_t NpuCommunicatorAICPU::GatherImpl(const GatherParams &params) noexcept
+{
+    if (params.root >= groupInfo_.groupSize) {
+        ZBAL_LOG_ERROR("Gather root is invalid, root=" << params.root << ", groupSize=" << groupInfo_.groupSize);
+        return Z_INVALID_PARAM;
+    }
+    if (params.dataType < 0 || params.dataType >= ZBAL_DATA_TYPE_BUTT) {
+        ZBAL_LOG_ERROR("Gather data type is invalid, dataType=" << params.dataType << ", root=" << params.root);
+        return Z_INVALID_PARAM;
+    }
+    if (groupInfo_.myGroupRank == params.root && params.recvBuff == nullptr) {
+        ZBAL_LOG_ERROR("Gather receive buffer is null on root, rank="
+                       << groupInfo_.myGroupRank << ", root=" << params.root << ", dataCount=" << params.dataCount);
+        return Z_INVALID_PARAM;
+    }
+
+    const uint64_t typeSize = ZBALDataTypeSize(static_cast<uint32_t>(params.dataType));
+    if (typeSize == 0) {
+        ZBAL_LOG_ERROR("Gather data type size is zero, dataType=" << params.dataType << ", root=" << params.root);
+        return Z_INVALID_PARAM;
+    }
+    if (params.dataCount > UINT64_MAX / typeSize) {
+        ZBAL_LOG_ERROR("Gather size overflow, rank=" << groupInfo_.myGroupRank << ", root=" << params.root
+                                                     << ", dataCount=" << params.dataCount
+                                                     << ", dataType=" << params.dataType);
+        return Z_INVALID_PARAM;
+    }
+
+    uint64_t rootExchangeGva = CalcPeerExchangeGva(params.root);
+    return LaunchAicpuOp(launcher_, ZBAL_CMD_GATHER, reinterpret_cast<uint64_t>(params.sendBuff),
+                         reinterpret_cast<uint64_t>(params.recvBuff), params.dataCount,
+                         static_cast<uint32_t>(params.dataType), static_cast<uint32_t>(params.root), "Gather",
+                         params.stream, 0, 0, 0, rootExchangeGva);
+}
+
+int32_t NpuCommunicatorAICPU::Broadcast(const void *buf, uint64_t dataCount, zbal_datatype_t dataType, uint16_t root,
+                                        aclrtStream stream) noexcept
+{
+    uint64_t bufGva = reinterpret_cast<uint64_t>(buf);
+    return LaunchAicpuOp(launcher_, ZBAL_CMD_BROADCAST, bufGva, bufGva, dataCount, static_cast<uint32_t>(dataType),
+                         static_cast<uint32_t>(root), "Broadcast", stream);
+}
+
+int32_t NpuCommunicatorAICPU::AlltoAllV(const void *sendBuff, void *recvBuff, void *sendCumSum, void *recvSplitCounts,
+                                        void *elements, zbal_datatype_t dataType, aclrtStream stream) noexcept
+{
+    return LaunchAicpuOp(launcher_, ZBAL_CMD_ALLTOALLV, reinterpret_cast<uint64_t>(sendBuff),
+                         reinterpret_cast<uint64_t>(recvBuff), 0, static_cast<uint32_t>(dataType), 0, "AlltoAllV",
+                         stream, 0, 0, 0, reinterpret_cast<uint64_t>(sendCumSum),
+                         reinterpret_cast<uint64_t>(recvSplitCounts), reinterpret_cast<uint64_t>(elements));
+}
+
+/* Calculate peer's exchange area GVA using WORLD rank difference.
+ * SMA memory is laid out by world rank: rank r's memory is at [base + r * memSize].
+ * P2P communicators may have non-adjacent world ranks (e.g., world rank 0 and 3
+ * in a 2-rank P2P group), so local rank delta != world rank delta.
+ * AIV's ZbalPtr handles this via worldRanks[] mapping; AICPU receives the
+ * pre-computed peer exchange GVA via reserved[0]. */
+uint64_t NpuCommunicatorAICPU::CalcPeerExchangeGva(uint32_t peer) const noexcept
+{
+    uint16_t myWorldRank = groupInfo_.peerGroupRank2WorldRank[groupInfo_.myGroupRank];
+    uint16_t peerWorldRank = groupInfo_.peerGroupRank2WorldRank[peer];
+    int64_t worldDelta = static_cast<int64_t>(peerWorldRank) - static_cast<int64_t>(myWorldRank);
+    return groupInfo_.myAddressExchangeGva +
+           static_cast<uint64_t>(worldDelta * static_cast<int64_t>(groupInfo_.localDeviceMemSize));
+}
+
+int32_t NpuCommunicatorAICPU::Send(const void *sendBuff, zbal_datatype_t dataType, uint32_t peer,
+                                   aclrtStream stream) noexcept
+{
+    uint64_t peerExchangeGva = CalcPeerExchangeGva(peer);
+    return LaunchAicpuOp(launcher_, ZBAL_CMD_SEND, reinterpret_cast<uint64_t>(sendBuff), 0, 0,
+                         static_cast<uint32_t>(dataType), peer, "Send", stream, 0, 0, 0, peerExchangeGva, 0, 0);
+}
+
+int32_t NpuCommunicatorAICPU::Recv(const void *recvBuff, size_t recvCount, zbal_datatype_t dataType, uint32_t peer,
+                                   aclrtStream stream) noexcept
+{
+    uint64_t recvBufGva = reinterpret_cast<uint64_t>(recvBuff);
+    uint64_t peerExchangeGva = CalcPeerExchangeGva(peer);
+    return LaunchAicpuOp(launcher_, ZBAL_CMD_RECV, recvBufGva, recvBufGva, recvCount, static_cast<uint32_t>(dataType),
+                         peer, "Recv", stream, 0, 0, 0, peerExchangeGva, 0, 0);
+}
+} // namespace operators
+} // namespace zbal

@@ -1,0 +1,130 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+ * MemFabric_Hybrid is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ *          http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+ * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+*/
+#ifndef MEM_FABRIC_HYBRID_HYBM_DATA_ACTION_H
+#define MEM_FABRIC_HYBRID_HYBM_DATA_ACTION_H
+
+#include <functional>
+#include <ostream>
+#include <unordered_map>
+#include "hybm_common_include.h"
+#include "hybm_big_mem.h"
+#include "hybm_va_manager.h"
+
+namespace ock {
+namespace mf {
+
+struct PairHash {
+    std::size_t operator()(const std::pair<uint32_t, uint32_t> &p) const
+    {
+        return (static_cast<uint64_t>(p.first) << 32ULL) + static_cast<uint64_t>(p.second);
+    }
+};
+
+struct PairEqual {
+    bool operator()(const std::pair<uint32_t, uint32_t> &lhs, const std::pair<uint32_t, uint32_t> &rhs) const
+    {
+        return lhs.first == rhs.first && lhs.second == rhs.second;
+    }
+};
+
+struct ExtOptions {
+    uint32_t srcRankId;
+    uint32_t destRankId;
+    void *stream = nullptr;
+    uint32_t flags;
+    std::unordered_map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>, PairHash, PairEqual> groupMap;
+};
+
+class DataOperator {
+public:
+    virtual Result Initialize() noexcept = 0;
+    virtual void UnInitialize() noexcept = 0;
+
+    virtual Result DataCopy(hybm_copy_params &params, hybm_data_copy_direction direction,
+                            const ExtOptions &options) noexcept = 0;
+    virtual Result BatchDataCopy(hybm_batch_copy_params &params, hybm_data_copy_direction direction,
+                                 const ExtOptions &options) noexcept = 0;
+    /*
+     * 异步data copy
+     * @return 0 if successful, > 0 is wait id, < 0 is error
+     */
+    virtual Result DataCopyAsync(hybm_copy_params &params, hybm_data_copy_direction direction,
+                                 const ExtOptions &options) noexcept = 0;
+
+    virtual Result Wait(int32_t waitId) noexcept = 0;
+
+    virtual void CacheRankProtocols(uint32_t rankId, const std::vector<uint32_t> &protocols)
+    {
+        (void)rankId;
+        (void)protocols;
+    }
+
+    virtual void TransformVa(void *&src, void *&dst, hybm_data_copy_direction direction) noexcept = 0;
+
+    Result TryTransformVa(void *&src, void *&dst, hybm_data_copy_direction direction) noexcept
+    {
+        BM_ASSERT_LOG_AND_RETURN(static_cast<uint32_t>(direction) < HYBM_DATA_COPY_DIRECTION_AUTO,
+                                 "Invalid copy direction=" << direction, BM_INVALID_PARAM);
+        void *convertedSrc = src;
+        void *convertedDst = dst;
+        TransformVa(convertedSrc, convertedDst, direction);
+        BM_ASSERT_LOG_AND_RETURN(reinterpret_cast<uint64_t>(convertedSrc) != HVM_INVALID_VA &&
+                                     reinterpret_cast<uint64_t>(convertedDst) != HVM_INVALID_VA,
+                                 "Missing GVA registration: src=" << VaToStr(src) << " dst=" << VaToStr(dst)
+                                                                  << " direction=" << direction,
+                                 BM_GVA_NOT_FOUND);
+        src = convertedSrc;
+        dst = convertedDst;
+        return BM_OK;
+    }
+
+    virtual ~DataOperator() = default;
+
+public:
+    void UpdateGvaSpace(hybm_mem_type type, uint64_t gva, uint64_t localSpaceSize, uint64_t rankCount) noexcept
+    {
+        if (type == HYBM_MEM_TYPE_BUTT || localSpaceSize == 0) {
+            BM_LOG_ERROR("type " << type << " error, local space " << localSpaceSize);
+            return;
+        }
+        gva_[type] = gva;
+        localSpaceSize_[type] = localSpaceSize;
+        rankCount_[type] = rankCount;
+        BM_LOG_INFO("update type " << type << ", gva:0x" << std::hex << gva_[type] << ", space:" << std::dec
+                                   << localSpaceSize_[type] << ", rankCnt:" << rankCount_[type]);
+    };
+
+    virtual void CleanUp() noexcept
+    {
+        BM_LOG_DEBUG("DataOperator not support");
+        return;
+    }
+
+    // 注入 imported gva → 本实体映射地址 的解析器：同进程多实体同址共存（多 store 组窗口号撞车）时，
+    // 全局台账的同 gva 行无法区分连接，由实体注入自己的导入记录解析；未命中由调用方回退全局台账
+    virtual void SetImportedGvaResolver(std::function<uint64_t(uint64_t)> resolver) noexcept
+    {
+        importedGvaResolver_ = std::move(resolver);
+    }
+
+protected:
+    static inline uint64_t gva_[HYBM_MEM_TYPE_BUTT] = {0};
+    static inline uint64_t localSpaceSize_[HYBM_MEM_TYPE_BUTT] = {0};
+    static inline uint64_t rankCount_[HYBM_MEM_TYPE_BUTT] = {0};
+    std::function<uint64_t(uint64_t)> importedGvaResolver_{};
+};
+
+using DataOperatorPtr = std::shared_ptr<DataOperator>;
+} // namespace mf
+} // namespace ock
+
+#endif // MEM_FABRIC_HYBRID_HYBM_DATA_ACTION_H

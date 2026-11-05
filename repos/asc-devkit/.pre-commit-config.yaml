@@ -1,0 +1,88 @@
+minimum_pre_commit_version: 4.0.0
+exclude: ^LICENSES/|\.(html|csv|svg|tsv)$
+
+default_stages: [pre-commit]
+ci:
+  autofix_prs: false
+  autoupdate_schedule: monthly
+
+repos:
+  # pre-commit 基础检查
+  - repo: https://gitcode.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: \.md$
+      - id: end-of-file-fixer
+        exclude: \.md$
+      - id: check-yaml
+        args: ["--allow-multiple-documents"]
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-json
+        exclude: ^\.devcontainer/devcontainer\.json$
+
+  # C++ 代码格式化检查
+  - repo: https://gitcode.com/pre-commit-clang/mirrors-clang-format
+    rev: v18.1.8
+    hooks:
+      - id: clang-format
+        types_or: [file]
+        files: \.(c|h|cpp|hpp|cc|hh|cxx|hxx|asc)$
+        exclude: ^(tests/python/aclrt_launch_kernel/stub_files/|include/utils/)
+        args:
+          - "--style=file"
+          - "--verbose"
+          - "-i"
+
+  # Python 代码检查
+  - repo: https://gitcode.com/gh_mirrors/ru/ruff-pre-commit
+    rev: v0.14.14
+    hooks:
+      - id: ruff-check
+        args:
+          - "--output-format"
+          - "github"
+          - "--fix"
+          - "--extend-ignore"
+          - "E402,E711,E712,E721,F401,F403,F405,F811,F821,F841,F523,E741,F601"
+        types: [python]
+      - id: ruff-format
+        types: [python]
+
+  # 拼写检查
+  - repo: https://gitcode.com/gh_mirrors/co/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        args: [
+            "-L",
+            "CANN,cann,NNAL,nnal,ASCEND,ascend,EnQue,CopyIn,ArchType,AND,ND,tbe,copyin,alog,Collet,Enque,Normale,OUTTER,OffsetT,REGIST,Te,ThirdParty,VOR,abl,ans,catched,commiter,devlop,dout,enque,ges,nIn,nd,outter,padd,parm,subtile,te",
+            "--skip",
+            "*.py,*.cpp,*.hpp,*.c,*.h,*.asc,*.cc",
+          ]
+
+  # OAT 合规性检查 (Open Source Audit Tool) — 远程 Python hook
+  - repo: https://gitcode.com/HiAgent/compliance
+    rev: v1.0.6
+    hooks:
+      - id: oat-check
+        pass_filenames: true
+        stages: [pre-commit]
+        verbose: true
+
+
+  # Markdown 链接有效性检查
+  - repo: local
+    hooks:
+      - id: markdown-link-check
+        name: Markdown link check
+        entry: env LYCHEE_VERSION=0.23.0 bash scripts/markdown_link_check.sh
+        language: system
+        files: \.(md|markdown|mdx)$
+        exclude: ^CHANGELOG(_en)?\.md$
+        pass_filenames: true
+        always_run: true
+        stages: [pre-commit, manual]
+        verbose: true

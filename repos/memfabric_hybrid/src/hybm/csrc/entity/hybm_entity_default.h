@@ -1,0 +1,147 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+ * MemFabric_Hybrid is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ *          http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+ * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+ */
+#ifndef MEM_FABRIC_HYBRID_HYBM_ENGINE_IMPL_H
+#define MEM_FABRIC_HYBRID_HYBM_ENGINE_IMPL_H
+
+#include <map>
+#include <mutex>
+
+#include "hybm_common_include.h"
+#include "hybm_data_operator.h"
+#include "hybm_dev_legacy_segment.h"
+#include "hybm_entity.h"
+#include "hybm_mem_segment.h"
+#include "hybm_transport_common.h"
+#include "hybm_transport_manager.h"
+
+namespace ock {
+namespace mf {
+struct EntityExportInfo {
+    uint64_t magic{ENTITY_EXPORT_INFO_MAGIC};
+    uint32_t rankId{0};
+    uint16_t role{0};
+    uint16_t reserved{0};
+    char nic[64]{};
+    uint32_t layerCount{0};
+    hybm_data_op_type layers[EXPORT_INFO_MAX_LAYER_COUNT]{};
+    uint32_t superPodId{0xFFFFFFFFU};
+    uint32_t serverId{0x3FFU};
+    int32_t devicePhyId{-1};
+    transport::TransportPrivateData transportPrivateData{};
+};
+struct SliceExportTransportKey {
+    uint32_t rankId;
+    uint16_t reserved[2]{};
+    uint64_t address;
+    transport::TransportMemoryKey key;
+    SliceExportTransportKey() : SliceExportTransportKey{0, 0, 0} {}
+    SliceExportTransportKey(uint64_t mag, uint32_t rank, uint64_t addr) : rankId{rank}, address{addr}, key{} {}
+};
+
+class MemEntityDefault : public MemEntity {
+public:
+    explicit MemEntityDefault(int32_t id) noexcept;
+    ~MemEntityDefault() override;
+
+    int32_t Initialize(const hybm_options *options) noexcept override;
+    void UnInitialize() noexcept override;
+
+    int32_t ReserveMemorySpace() noexcept override;
+    int32_t QueryMemorySpace(uint64_t &address) noexcept;
+    int32_t ReserveMemorySpaceAt(uint64_t address) noexcept;
+    int32_t UnReserveMemorySpace() noexcept override;
+    void *GetReservedMemoryPtr(hybm_mem_type memType) noexcept override;
+
+    int32_t AllocLocalMemory(uint64_t size, hybm_mem_type mType, uint32_t flags,
+                             hybm_mem_slice_t &slice) noexcept override;
+    int32_t RegisterLocalMemory(const void *ptr, uint64_t size, uint32_t flags,
+                                hybm_mem_slice_t &slice) noexcept override;
+    int32_t FreeLocalMemory(hybm_mem_slice_t slice, uint32_t flags) noexcept override;
+
+    int32_t ExportEntityExchangeInfo(ExchangeInfoWriter &desc, uint32_t flags) noexcept override;
+    int32_t ExportSliceExchangeInfo(hybm_mem_slice_t slice, ExchangeInfoWriter &desc, uint32_t flags) noexcept override;
+    int32_t ImportSliceExchangeInfo(const ExchangeInfoReader desc[], uint32_t count, void *addresses[],
+                                    uint32_t flags) noexcept override;
+    int32_t ImportEntityExchangeInfo(const ExchangeInfoReader desc[], uint32_t count, uint32_t flags) noexcept override;
+    int32_t RemoveImported(const std::vector<uint32_t> &ranks) noexcept override;
+
+    int32_t SetExtraContext(const void *context, uint32_t size) noexcept override;
+
+    int32_t Mmap() noexcept override;
+    void Unmap() noexcept override;
+
+    int32_t CopyData(hybm_copy_params &params, hybm_data_copy_direction direction, void *stream,
+                     uint32_t flags) noexcept override;
+    int32_t BatchCopyData(hybm_batch_copy_params &params, hybm_data_copy_direction direction, void *stream,
+                          uint32_t flags) noexcept override;
+    int32_t Wait() noexcept override;
+
+    bool SdmaReaches(uint32_t remoteRank) const noexcept override;
+    hybm_data_op_type CanReachDataOperators(uint32_t remoteRank) const noexcept override;
+    void *GetSliceVa(hybm_mem_slice_t slice, uint32_t flags);
+    uint64_t GetSliceSize(hybm_mem_slice_t slice);
+    int32_t ConnectTransport(const uint32_t *ranks, uint32_t count, uint32_t flags) noexcept override;
+    int32_t UnmapRank(uint32_t rankId) noexcept override;
+
+private:
+    static int CheckOptions(const hybm_options *options) noexcept;
+    int32_t LoadExtendLibrary() noexcept;
+    int32_t UpdateHybmDeviceInfo(uint32_t extCtxSize) noexcept;
+    void SetHybmDeviceInfo(HybmDeviceMeta &info);
+    int32_t ImportForTransport() noexcept;
+    int32_t ImportForSegment(const ExchangeInfoReader desc[], uint32_t count, void *addresses[],
+                             uint32_t overrideRank = HYBM_IMPORT_RANK_INVALID) noexcept;
+    Result LocateAddrAndRank(void *&src, void *&dest, std::pair<uint32_t, uint32_t> &p2pInfo) noexcept;
+
+    Result InitSegment();
+    Result InitHbmSegment();
+    Result InitDramSegment();
+    Result InitTransManager();
+    Result InitDataOperator();
+    Result InitTagManager();
+    Result RetainHostMemory(const void *address, uint64_t size) noexcept;
+
+    void ReleaseResources();
+    int32_t SetThreadAclDevice();
+    int32_t ImportForTransportManager();
+    int32_t ImportForTransportPrecheck(const ExchangeInfoReader *desc, uint32_t &count, void *addresses[],
+                                       uint32_t overrideRank);
+    int32_t ImportForLayerProtocols();
+
+private:
+    bool initialized_{false};
+    const int32_t id_; /* id of the engine */
+    hybm_options options_{};
+    void *hbmGva_{nullptr};  // the hbm medium, started gva, no rankId offset
+    void *dramGva_{nullptr}; // the dram medium, started gva, no rankId offset
+    std::mutex managedAllocationsMutex_;
+    // Keep native backing alive through registration failures and release it after segment teardown.
+    std::unordered_map<void *, std::shared_ptr<void>> managedAllocations_;
+    // trans 场景：装载 AsymmetricMemSegment，单段同时管理 HBM/DRAM
+    // 用户注册内存（段内按地址分流）；非 trans 场景：装载纯 HBM 段。
+    // 两种场景共用此槽位，成员名保持不变（见 doc/asymmetric_mem_segment_改造方案.md 3.5）
+    std::shared_ptr<MemSegment> hbmSegment_{nullptr};
+    std::shared_ptr<MemSegment> dramSegment_{nullptr};
+    std::shared_ptr<DataOperator> dataOperator_;
+    bool transportPrepared_{false};
+    std::mutex transportMutex_;
+    std::mutex importMutex_;
+    transport::TransManagerPtr transportManager_;
+    std::unordered_map<uint32_t, EntityExportInfo> importedRanks_;
+    std::unordered_map<uint32_t, std::set<transport::TransportMemoryKey>> importedMemories_;
+    HybmEntityTagInfoPtr tagManager_;
+};
+using EngineImplPtr = std::shared_ptr<MemEntityDefault>;
+} // namespace mf
+} // namespace ock
+
+#endif // MEM_FABRIC_HYBRID_HYBM_ENGINE_IMPL_H

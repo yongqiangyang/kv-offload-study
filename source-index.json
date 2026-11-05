@@ -1,0 +1,252 @@
+{
+  "runner": {
+    "file": "repos/vllm-ascend/vllm_ascend/worker/v2/model_runner.py",
+    "line": 488,
+    "symbol": "self.sparse_kv_offload_manager = init_sparse_kv_offload_manager("
+  },
+  "budget": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py",
+    "line": 239,
+    "symbol": "def plan_sparse_kv_offload_memory("
+  },
+  "upstream": {
+    "file": "repos/vllm/docs/design/hisparse.md",
+    "line": 1,
+    "symbol": "# HiSparse"
+  },
+  "manager": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py",
+    "line": 476,
+    "symbol": "class SparseKVOffloadManager:"
+  },
+  "manager_init": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py",
+    "line": 543,
+    "symbol": "config = offload.OffloadConfig()"
+  },
+  "offload_bind": {
+    "file": "repos/memfabric_hybrid/src/acc_offload/csrc/python_wrapper/pymf_acc_offload.cpp",
+    "line": 27,
+    "symbol": "void DefineAccOffloadConfig("
+  },
+  "offload_c": {
+    "file": "repos/memfabric_hybrid/src/acc_offload/csrc/acc_offload.cpp",
+    "line": 18,
+    "symbol": "OFFLOAD_API int32_t offload_init("
+  },
+  "shared_init": {
+    "file": "repos/memfabric_hybrid/src/acc_offload/csrc/acc_offload_shared_dram_entry.cpp",
+    "line": 469,
+    "symbol": "int32_t AccOffloadSharedDramEntry::Initialize("
+  },
+  "aligned_alloc": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py",
+    "line": 180,
+    "symbol": "def empty_aligned_int8_cpu_tensors("
+  },
+  "offload_py": {
+    "file": "repos/memfabric_hybrid/src/smem/python/memfabric_hybrid/memfabric_hybrid/mf_acc_offload.py",
+    "line": 22,
+    "symbol": "def empty(sizes,"
+  },
+  "writeback": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py",
+    "line": 1164,
+    "symbol": "def _offload_new_kv_on_current_stream("
+  },
+  "tail_copy": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py",
+    "line": 1114,
+    "symbol": "def copy_sfa_kv("
+  },
+  "sparse_c": {
+    "file": "repos/memfabric_hybrid/src/acc_offload/csrc/acc_offload.cpp",
+    "line": 55,
+    "symbol": "OFFLOAD_API int32_t offload_sparse_copy("
+  },
+  "sparse_launch": {
+    "file": "repos/memfabric_hybrid/src/acc_offload/csrc/launch/acc_offload_operators_launch.cpp",
+    "line": 19,
+    "symbol": "void AccOffloadSparseCopy("
+  },
+  "te_build": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/utils/memfabric_transfer_engine.py",
+    "line": 161,
+    "symbol": "def _build_engine("
+  },
+  "te_cpp_init": {
+    "file": "repos/memfabric_hybrid/src/smem/csrc/python_wrapper/mk_transfer_adapter/csrc/pytransfer.cpp",
+    "line": 45,
+    "symbol": "int TransferAdapterPy::Initialize("
+  },
+  "te_port": {
+    "file": "repos/memfabric_hybrid/src/smem/csrc/python_wrapper/mk_transfer_adapter/csrc/pytransfer.cpp",
+    "line": 110,
+    "symbol": "int TransferAdapterPy::GetRpcPort("
+  },
+  "te_register": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/utils/memfabric_transfer_engine.py",
+    "line": 206,
+    "symbol": "def register_buffer("
+  },
+  "producer_register": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_p2p/sfa_pd_rd2h/worker.py",
+    "line": 856,
+    "symbol": "global_memfabric_te.register_buffer(register_regions.ptrs, register_regions.lengths)"
+  },
+  "te_cpp_register": {
+    "file": "repos/memfabric_hybrid/src/smem/csrc/python_wrapper/mk_transfer_adapter/csrc/pytransfer.cpp",
+    "line": 326,
+    "symbol": "int TransferAdapterPy::RegisterMemory("
+  },
+  "pd_read": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_p2p/sfa_pd_rd2h/read_thread.py",
+    "line": 1125,
+    "symbol": "ret = self.engine.batch_transfer_sync_read(p_session, all_local_ptrs, all_peer_ptrs, all_lengths)"
+  },
+  "te_cpp_read": {
+    "file": "repos/memfabric_hybrid/src/smem/csrc/python_wrapper/mk_transfer_adapter/csrc/pytransfer.cpp",
+    "line": 228,
+    "symbol": "int TransferAdapterPy::BatchTransferSyncRead("
+  },
+  "trans_c": {
+    "file": "repos/memfabric_hybrid/src/smem/csrc/smem_trans/smem_trans.cpp",
+    "line": 241,
+    "symbol": "SMEM_API int32_t smem_trans_batch_read("
+  },
+  "trans_connection": {
+    "file": "repos/memfabric_hybrid/src/smem/csrc/smem_trans/smem_trans_connection.cpp",
+    "line": 765,
+    "symbol": "Result SmemTransConnection::BatchSyncTransfer("
+  },
+  "te_adapter": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/utils/memfabric_transfer_engine.py",
+    "line": 27,
+    "symbol": "class MemfabricBackend:"
+  },
+  "shared_reserve": {
+    "file": "repos/memfabric_hybrid/src/acc_offload/csrc/acc_offload_shared_dram_entry.cpp",
+    "line": 298,
+    "symbol": "int32_t AccOffloadSharedDramEntry::ReserveSharedPool("
+  },
+  "shared_create": {
+    "file": "repos/memfabric_hybrid/src/acc_offload/csrc/acc_offload_shared_dram_entry.cpp",
+    "line": 327,
+    "symbol": "int32_t AccOffloadSharedDramEntry::CreateEntityAndPool("
+  },
+  "shared_map": {
+    "file": "repos/memfabric_hybrid/src/acc_offload/csrc/acc_offload_shared_dram_entry.cpp",
+    "line": 398,
+    "symbol": "int32_t AccOffloadSharedDramEntry::MapPool("
+  },
+  "vmm_map": {
+    "file": "repos/memfabric_hybrid/src/hybm/csrc/mm/hybm_vmm_based_segment.cpp",
+    "line": 338,
+    "symbol": "Result HybmVmmBasedSegment::MapMemBySetAccess("
+  },
+  "register_caches": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py",
+    "line": 741,
+    "symbol": "def register_kv_caches("
+  },
+  "restore_view": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py",
+    "line": 622,
+    "symbol": "def _restore_bfloat16_tensor("
+  },
+  "release_py": {
+    "file": "releases/memfabric-1.3.0-python/memfabric_hybrid/mf_acc_offload.py",
+    "line": 22,
+    "symbol": "def empty(sizes,"
+  },
+  "entry_manager": {
+    "file": "repos/memfabric_hybrid/src/acc_offload/csrc/acc_offload_entry_manager.cpp",
+    "line": 28,
+    "symbol": "AccOffloadEntryManager::~AccOffloadEntryManager("
+  },
+  "exec_kv": {
+    "file": "repos/vllm-ascend/vllm_ascend/attention/sfa_kv_offload.py",
+    "line": 854,
+    "symbol": "def exec_kv("
+  },
+  "sparse_kernel_entry": {
+    "file": "repos/memfabric_hybrid/src/acc_offload/csrc/operators/acc_offload_sparse_copy.cpp",
+    "line": 15,
+    "symbol": "extern \"C\" __global__ __aicore__ void OffloadSparseCopyOps("
+  },
+  "sparse_kernel": {
+    "file": "repos/memfabric_hybrid/src/acc_offload/csrc/operators/acc_offload_sparse_copy.h",
+    "line": 243,
+    "symbol": "class OffloadSparseCopyKernel"
+  },
+  "offload_new": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py",
+    "line": 1120,
+    "symbol": "def offload_new_kv("
+  },
+  "wait_writeback": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py",
+    "line": 1477,
+    "symbol": "def wait_for_current_kv_writeback("
+  },
+  "lim": {
+    "file": "repos/vllm-ascend/vllm_ascend/attention/sfa_kv_offload.py",
+    "line": 676,
+    "symbol": "def _lim_select("
+  },
+  "copy_sfa": {
+    "file": "repos/vllm-ascend/vllm_ascend/attention/sfa_kv_offload.py",
+    "line": 775,
+    "symbol": "def _copy_sfa_attention("
+  },
+  "copy_sfa_kernel": {
+    "file": "repos/vllm-ascend/csrc/attention/fused_scatter_copy_sparse_flash_attention/op_kernel/first_fill_scatter_copy_kernel.h",
+    "line": 22,
+    "symbol": "class FirstFillScatterCopyKernel"
+  },
+  "copy_sfa_readme": {
+    "file": "repos/vllm-ascend/csrc/attention/fused_scatter_copy_sparse_flash_attention/README.md",
+    "line": 1,
+    "symbol": "# FusedScatterCopySparseFlashAttention"
+  },
+  "trans_register": {
+    "file": "repos/memfabric_hybrid/src/smem/csrc/smem_trans/smem_trans_entry.cpp",
+    "line": 807,
+    "symbol": "Result SmemTransEntry::RegisterAndExportSlice("
+  },
+  "consumer_register": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_p2p/sfa_pd_rd2h/worker.py",
+    "line": 456,
+    "symbol": "def _register_memfabric_pull("
+  },
+  "send_wait": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_p2p/sfa_pd_rd2h/send_thread.py",
+    "line": 345,
+    "symbol": "p_save_event.synchronize()"
+  },
+  "read_ack": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_p2p/sfa_pd_rd2h/read_thread.py",
+    "line": 314,
+    "symbol": "sock.send_multipart((identity, b\"\", encoder.encode((READ_DONE, layer_idx))))"
+  },
+  "reuse_gate": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_p2p/sfa_pd_rd2h/worker.py",
+    "line": 1146,
+    "symbol": "def wait_for_layer_reuse("
+  },
+  "get_dva": {
+    "file": "repos/memfabric_hybrid/src/acc_offload/csrc/acc_offload_shared_dram_entry.cpp",
+    "line": 607,
+    "symbol": "int32_t AccOffloadSharedDramEntry::GetDva("
+  },
+  "offload_header": {
+    "file": "repos/memfabric_hybrid/src/acc_offload/include/host/acc_offload.h",
+    "line": 117,
+    "symbol": "uint64_t offload_malloc("
+  },
+  "memcache_backend": {
+    "file": "repos/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/memcache_backend.py",
+    "line": 223,
+    "symbol": "from memcache_hybrid import DistributedObjectStore"
+  }
+}

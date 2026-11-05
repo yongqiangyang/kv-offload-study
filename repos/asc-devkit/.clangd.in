@@ -1,0 +1,107 @@
+CompileFlags:
+  Add:
+    - "-std=c++17"
+    - "-stdlib=libstdc++"
+
+    # 定义 NPU 架构宏（用于条件编译）
+    # 可选值: 2201(Atlas A2/A3 系列), 3510(Ascend 950PR/Ascend 950DT)
+    - "-D__NPU_ARCH__=@NPU_ARCH@"
+
+    # 注入AscendC头文件路径(由脚本使用 ASCEND_HOME_PATH 渲染)
+    # asc/ 根目录必须在列表中：CANN 头文件内部大量使用 #include "impl/..." 相对路径
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/asc"
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/asc/include"
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/asc/include/adv_api/matmul"
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/asc/include/aicpu_api"
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/asc/include/basic_api"
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/asc/include/c_api"
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/asc/include/interface"
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/asc/include/simt_api"
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/asc/include/tiling"
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/asc/include/utils"
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/asc/include/utils/debug"
+
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/asc/impl"
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/asc/impl/adv_api"
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/asc/impl/basic_api"
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/asc/impl/c_api"
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/asc/impl/simt_api"
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/asc/impl/utils"
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/include"
+
+    # CPU 调试模式的 stub 定义（half, bfloat16_t, threadIdx 等类型均在此处）
+    # CANN 头文件在 ASCENDC_CPU_DEBUG=1 时会 #include "stub_def.h"，须确保可达
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/tools/cpudebug/lib/include"
+
+    # 高级 API（lib/matmul_intf.h, kernel_tiling/ 等）和 host 侧 tiling API
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/include/ascendc/highlevel_api"
+    - "-isystem"
+    - "@ASCEND_HOME_PATH@/include/ascendc/host_api"
+
+    # 启用 CPU 调试模式（仅供 IDE 诊断），使 CANN 头文件走 CPU 仿真分支
+    - "-DASCENDC_CPU_DEBUG=1"
+
+    # stub_def.h 未覆盖的关键字，须手动定义
+    - "-D__device__="
+    - "-D__launch_bounds__(x)="
+
+    # .aicpu未 #include "stub_def.h"，需手动添加
+    - "-D__global__="
+    - "-D__aicpu__="
+
+    # 抑制未知属性和其他不相关的警告
+    - "-Wno-unknown-attributes"
+    - "-Wno-ignored-attributes"
+    - "-Wno-gnu-zero-variadic-macro-arguments"
+    - "-Wno-nested-anon-types"
+
+Diagnostics:
+  UnusedIncludes: None
+  MissingIncludes: None
+  Suppress:
+    - "pp_file_not_found"       # 构建生成的头文件（*_op_resource.h, aclnn_*.h 等）
+    - "unknown-warning-option"  # 自定义 -Wno-* 可能不被 clangd 内置 clang 识别
+    - "macro-redefined"         # CANN 头文件内部重复定义 __BLOCK_LOCAL__ 等
+---
+If:
+  PathMatch: ".*\\.(asc|aicpu)$"
+CompileFlags:
+  # .asc/.aicpu 常缺少可用编译数据库，使用本文件内 flags 以稳定解析 AscendC 语法
+  CompilationDatabase: None
+  Add:
+    - "-x"
+    - "c++"
+
+# .asc/.aicpu 文件使用 <<<blocks, tiling, stream>>> kernel launch 语法，
+# clangd 无法解析，会产生级联误报，以下 suppress 项均为此兜底
+Diagnostics:
+  Suppress:
+    - "attributes_not_allowed"
+    - "decomp_decl_template"
+    - "ignored-attributes"
+    - "unknown_typename"
+    - "undeclared_var_use"
+    - "invalid_token_after_toplevel_declarator"
+    - "missing_type_specifier"
+    - "typename_nested_not_found"
+    - "redefinition"            # 限制在 AscendC 文件内，减少来自 CANN 头文件的重复定义诊断干扰

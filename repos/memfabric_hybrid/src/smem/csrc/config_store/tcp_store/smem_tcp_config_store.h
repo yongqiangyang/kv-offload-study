@@ -1,0 +1,236 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+ * MemFabric_Hybrid is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ *          http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+ * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+*/
+
+#ifndef SMEM_SMEM_TCP_CONFIG_STORE_H
+#define SMEM_SMEM_TCP_CONFIG_STORE_H
+
+#include <atomic>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <functional>
+
+#include "smem_config_store.h"
+#include "smem_group_manager.h"
+#include "smem_message_packer.h"
+#include "smem_group_command_async_dispatcher.h"
+#include "smem_group_manager_client.h"
+#include "smem_tcp_config_store_server.h"
+
+namespace ock {
+namespace smem {
+
+class ClientCommonContext {
+public:
+    virtual ~ClientCommonContext() = default;
+    virtual std::shared_ptr<ock::acc::AccTcpRequestContext> WaitFinished() noexcept = 0;
+    virtual void SetFinished(const ock::acc::AccTcpRequestContext &response) noexcept = 0;
+    virtual void SetFailedFinish() noexcept = 0;
+    virtual bool Blocking() const noexcept = 0;
+    virtual bool OnlyOneTime() const noexcept
+    {
+        return true;
+    }
+};
+
+class TcpConfigStore : public ConfigStoreManager, public SmemGroupManager {
+public:
+    TcpConfigStore(StoreBackendPtr storeBackend, std::string ip, uint16_t port, uint16_t model, bool skipRecover,
+                   uint32_t worldSize = 0, int32_t rankId = -1, SmemGroupManagerClientPtr tc = nullptr) noexcept;
+    ~TcpConfigStore() noexcept override;
+
+    Result Startup(const smem_tls_config &tlsConfig, int reconnectRetryTimes = -1) noexcept;
+    Result ClientStart(const smem_tls_config &tlsConfig, int reconnectRetryTimes = -1) noexcept;
+    Result ServerStart(const smem_tls_config &tlsConfig, int reconnectRetryTimes = -1) noexcept;
+    void Shutdown(bool afterFork = false) noexcept;
+
+    Result PrefixGet(const std::string &key, std::unordered_map<std::string, std::string> &value) noexcept override;
+    Result Set(const std::string &key, const std::vector<uint8_t> &value) noexcept override;
+    Result Add(const std::string &key, int64_t increment, int64_t &value) noexcept override;
+    Result Remove(const std::string &key, bool printKeyNotExist) noexcept override;
+    Result Append(const std::string &key, const std::vector<uint8_t> &value, uint64_t &newSize) noexcept override;
+    Result Cas(const std::string &key, const std::vector<uint8_t> &expect, const std::vector<uint8_t> &value,
+               std::vector<uint8_t> &exists) noexcept override;
+    Result Watch(const std::string &key,
+                 const std::function<void(int result, const std::string &, const std::vector<uint8_t> &)> &notify,
+                 uint32_t &wid) noexcept override;
+    Result Watch(WatchRankType type, const std::function<void(WatchRankType, uint32_t, Result)> &notify,
+                 uint32_t &wid) noexcept override;
+    Result Unwatch(uint32_t wid) noexcept override;
+    Result Write(const std::string &key, const std::vector<uint8_t> &value, const uint32_t offset) noexcept override;
+    Result QueryAlive(uint32_t rank, uint32_t &alive) noexcept override;
+    int Join(const RankFullInfo &info) noexcept override;
+
+    int Leave() noexcept override;
+
+    int ExtendMemory(const MultiBytes &additionalSlices) noexcept override;
+
+    void SendControlAckBatch(ControlOp ackOp, uint32_t senderRankId, const std::vector<uint32_t> &targetRankIds,
+                             const std::vector<int32_t> &results, uint64_t requestId) noexcept;
+    std::string GetCompleteKey(const std::string &key) noexcept override
+    {
+        return key;
+    }
+
+    std::string GetCommonPrefix() noexcept override
+    {
+        return "";
+    }
+
+    StorePtr GetCoreStore() noexcept override
+    {
+        return this;
+    }
+
+    void RegisterReconnectHandler(ConfigStoreReconnectHandler callback) noexcept override
+    {
+        reconnectHandler = callback;
+    }
+
+    void SetRankId(const int32_t &rankId) noexcept override;
+
+    Result ReConnectAfterBroken(int reconnectRetryTimes) noexcept override;
+    bool GetConnectStatus() noexcept override;
+    // 通过现有 leader 链路发一条轻量 GET 探测链路端到端是否存活。
+    // 收到任何响应（含 NOT_EXIST）即认为存活；发送失败/等待超时/无链路返回 false。
+    // 用于 etcd 抖动时避免对健康链路发起 rec:1 重连（会被服务端 already-active 反劫持拒绝）。
+    bool ProbeLeaderAlive(int timeoutMs = 2000) noexcept;
+    void SetConnectStatus(bool status) noexcept override;
+    void RegisterClientBrokenHandler(const ConfigStoreClientBrokenHandler &handler) noexcept override;
+
+    void RegisterServerBrokenHandler(const ConfigStoreServerBrokenHandler &handler) noexcept override;
+
+    uint32_t GetRankIdByLinkId(uint32_t linkId) const noexcept override
+    {
+        return accServer_ != nullptr ? accServer_->GetRankIdByLinkId(linkId) : UINT32_MAX;
+    }
+
+    void GetClusterStatusJson(std::string &out) noexcept override;
+
+    SmemGroupCommandAsyncDispatcher *GetAsyncDispatcher() const noexcept
+    {
+        return asyncDispatcher_.get();
+    }
+
+    const std::string &GetServerIp() const noexcept
+    {
+        return serverIp_;
+    }
+
+    uint16_t GetServerPort() const noexcept
+    {
+        return serverPort_;
+    }
+
+    // return started
+    bool SetServerInfo(const std::string &ip, uint16_t port)
+    {
+        std::unique_lock<std::recursive_mutex> guard(mutex_);
+        if (serverIp_ == ip && port == serverPort_) {
+            return clientStarted_;
+        }
+        serverIp_ = ip;
+        serverPort_ = port;
+        SetConnectStatus(false);
+        if (accClientLink_ != nullptr && accClientLink_->Established()) {
+            accClientLink_->Close();
+            accClientLink_ = nullptr;
+        }
+        return clientStarted_;
+    }
+
+protected:
+    Result GetReal(const std::string &key, std::vector<uint8_t> &value, int64_t timeoutMs) noexcept override;
+
+private:
+    std::shared_ptr<ock::acc::AccTcpRequestContext> SendMessageBlocked(const std::vector<uint8_t> &reqBody,
+                                                                       int waitTimeoutSec = 600) noexcept;
+    Result SendMessageNonBlock(const std::vector<uint8_t> &reqBody) noexcept;
+    Result LinkBrokenHandler(const ock::acc::AccTcpLinkComplexPtr &link) noexcept;
+    Result ReceiveResponseHandler(const ock::acc::AccTcpRequestContext &context) noexcept;
+    Result HandleControlMessage(SmemMessage &msg) noexcept;
+    Result HandleAddToWhitelist(SmemMessage &msg) noexcept;
+    Result HandleRemoveFromWhitelist(SmemMessage &msg) noexcept;
+    Result HandleEstablishConnection(SmemMessage &msg) noexcept;
+    Result HandleQueryLinkState(SmemMessage &msg) noexcept;
+    Result HandlePromoteToActive(SmemMessage &msg) noexcept;
+    Result HandleAddSlices(SmemMessage &msg) noexcept;
+    Result SendWatchRequest(const std::vector<uint8_t> &reqBody,
+                            const std::function<void(int result, const std::vector<uint8_t> &)> &notify, uint32_t &id,
+                            const std::string &key = {}) noexcept;
+    void HeartBeat() noexcept;
+    void InitAsyncDispatcher(uint32_t localRankId) noexcept;
+
+    // 断链看门狗：无外部断链接管方（HA 选举 / 组引擎）时，由心跳线程按
+    // HEARTBEAT_INTERVAL 周期做一次有界重连，避免断链后长时间无人触发重连。
+    void TryReconnectByHeartbeat() noexcept;
+    bool HasExternalBrokenHandler() noexcept;
+    // 带去重的单次重连：send 触发与心跳看门狗共用，保证任意时刻只有一个
+    // ReConnectAfterBroken 在执行，避免并发 ConnectToPeerServer 破坏 acc 握手。
+    void ReconnectWithDedup() noexcept;
+
+    int32_t LocalNonBlockSend(int16_t msgType, uint32_t seqNo, const acc::AccDataBufferPtr &d,
+                              const acc::AccDataBufferPtr &cbCtx)
+    {
+        std::lock_guard<std::recursive_mutex> guard(mutex_);
+        if (accClientLink_ == nullptr) {
+            return acc::ACC_LINK_ERROR;
+        }
+        auto ret = accClientLink_->NonBlockSend(msgType, seqNo, d, cbCtx);
+        if (ret == acc::ACC_LINK_ERROR) {
+            ReconnectWithDedup();
+            if (accClientLink_ == nullptr) {
+                return acc::ACC_LINK_ERROR;
+            }
+            ret = accClientLink_->NonBlockSend(msgType, seqNo, d, cbCtx);
+        }
+        return ret;
+    }
+
+private:
+    AccStoreServerPtr accServer_;
+    ock::acc::AccTcpServerPtr accClient_;
+    ock::acc::AccTcpLinkComplexPtr accClientLink_;
+
+    std::mutex msgCtxMutex_;
+    std::unordered_map<uint32_t, std::shared_ptr<ClientCommonContext>> msgClientContext_;
+    static std::atomic<uint32_t> reqSeqGen_;
+
+    std::recursive_mutex mutex_;
+    std::string serverIp_;
+    uint16_t serverPort_;
+    const uint16_t startupModel_;
+    bool skipRecover_;
+    int32_t rankId_;
+    const uint32_t worldSize_;
+    std::atomic<bool> isConnect_{false};
+    // True once ClientStart/ServerStart has initialized accClient_/accServer_.
+    // Used by SetServerInfo to tell HaConfigStore::ConnectClient whether to do a
+    // first-time ClientStart() or a ReConnectAfterBroken(). Previously this was
+    // guarded by `rankId_ >= 0`, which broke the moment a real rankId was
+    // supplied up-front (etcd HA path): first ConnectClient then wrongly took
+    // the reconnect branch and dereferenced an uninitialized accClient_.
+    bool clientStarted_{false};
+    ConfigStoreReconnectHandler reconnectHandler{nullptr};
+    std::mutex brokenHandlerMutex_;
+    std::vector<ConfigStoreClientBrokenHandler> brokenHandler_;
+    std::atomic<bool> isRunning_{false};
+    std::atomic<bool> reconnecting_{false};
+    std::thread heartBeatThread_;
+    StoreBackendPtr backend_;
+    std::unique_ptr<SmemGroupCommandAsyncDispatcher> asyncDispatcher_;
+};
+using TcpConfigStorePtr = SmRef<TcpConfigStore>;
+} // namespace smem
+} // namespace ock
+
+#endif // SMEM_SMEM_TCP_CONFIG_STORE_H

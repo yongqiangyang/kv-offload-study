@@ -1,0 +1,1568 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+ * MemFabric_Hybrid is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ *          http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+ * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+ */
+#include "hybm_entity_default.h"
+
+#include <algorithm>
+#include <cstring>
+#include <exception>
+
+#include "dl_acl_api.h"
+#include "dl_api.h"
+#include "dl_hal_api.h"
+
+#include "hybm_compose_data_op.h"
+#include "hybm_data_op_host_rdma.h"
+#include "hybm_data_op_host_shm.h"
+#include "hybm_dev_legacy_segment.h"
+#include "hybm_ex_info_transfer.h"
+#include "hybm_gva.h"
+#include "hybm_logger.h"
+#include "hybm_ptracer.h"
+#include "hybm_va_manager.h"
+#include "mf_fault_injection_point.h"
+
+namespace ock {
+namespace mf {
+
+MemEntityDefault::MemEntityDefault(int id) noexcept : id_(id), initialized_(false) {}
+
+MemEntityDefault::~MemEntityDefault()
+{
+    ReleaseResources();
+}
+
+Result MemEntityDefault::InitTagManager()
+{
+    BM_ASSERT_LOG_AND_RETURN(tagManager_ == nullptr, "tagManager_ is not nullptr", BM_OK);
+    tagManager_ = std::make_shared<HybmEntityTagInfo>();
+    BM_ASSERT_LOG_AND_RETURN(tagManager_->TagInfoInit(options_) == BM_OK, "Failed to init tagManager",
+                             BM_INVALID_PARAM);
+    std::vector<hybm_data_op_type> layerProtocols;
+    if (tagManager_ != nullptr) {
+        layerProtocols = tagManager_->GetLayersForRank(options_.rankId);
+    }
+    if (!layerProtocols.empty()) {
+        uint32_t layerOpMask = 0U;
+        for (auto layer : layerProtocols) {
+            layerOpMask |= static_cast<uint32_t>(layer);
+        }
+        options_.bmDataOpType = static_cast<hybm_data_op_type>(layerOpMask);
+        BM_LOG_DEBUG("Layer protocol overrides data op type, rankId:"
+                     << options_.rankId << " dataOpType:" << layerOpMask << " layerCount:" << layerProtocols.size());
+        return BM_OK;
+    }
+    BM_LOG_TRACE("Success to init tag manager legacy data op type:" << options_.bmDataOpType
+                                                                    << " rankId:" << options_.rankId);
+    return BM_OK;
+}
+
+int32_t MemEntityDefault::Initialize(const hybm_options *options) noexcept
+{
+    BM_ASSERT_LOG_AND_RETURN(!initialized_, "the object is initialized.", BM_OK);
+    BM_ASSERT_LOG_AND_RETURN((id_ >= 0 && (uint32_t)(id_) < HYBM_ENTITY_NUM_MAX),
+                             "input entity id is invalid, input: " << id_
+                                                                   << " must be less than: " << HYBM_ENTITY_NUM_MAX,
+                             BM_INVALID_PARAM);
+    BM_ASSERT_LOG_AND_RETURN(CheckOptions(options) == BM_OK, "options is invalid.", BM_INVALID_PARAM);
+    options_ = *options;
+    if ((options_.flags & HYBM_FLAG_CREATE_WITH_SHM) == 0) {
+        options_.dramShmFd = -1;
+    }
+
+    // init tag info
+    BM_ASSERT_LOG_AND_RETURN(InitTagManager() == BM_OK, "Failed to init tag manager.", BM_ERROR);
+    // load dlopen lib
+    BM_ASSERT_LOG_AND_RETURN(LoadExtendLibrary() == BM_OK, "Failed to load extend library.", BM_ERROR);
+    // init segment
+    BM_ASSERT_LOG_AND_RETURN(InitSegment() == BM_OK, "Failed to init segment.", BM_ERROR);
+    // init transManager
+    BM_ASSERT_LOG_AND_RETURN(InitTransManager() == BM_OK, "Failed to init trans manager.", BM_ERROR);
+    // init dataOperator
+    BM_ASSERT_LOG_AND_RETURN(InitDataOperator() == BM_OK, "Failed to init data operator.", BM_ERROR);
+
+    initialized_ = true;
+    BM_LOG_INFO("Initialize success: " << options_);
+    return BM_OK;
+}
+
+void MemEntityDefault::UnInitialize() noexcept
+{
+    ReleaseResources();
+}
+
+int32_t MemEntityDefault::QueryMemorySpace(uint64_t &address) noexcept
+{
+    uint64_t size = options_.maxDRAMSize * options_.rankCount;
+    address = HybmVaManager::GetInstance().QueryReserveGva(size);
+    return address == 0 ? BM_ERROR : BM_OK;
+}
+
+int32_t MemEntityDefault::ReserveMemorySpaceAt(uint64_t address) noexcept
+{
+    dramSegment_->SetReserveAddress(address);
+    auto ret = ReserveMemorySpace();
+    dramSegment_->SetReserveAddress(0);
+    return ret;
+}
+
+int32_t MemEntityDefault::ReserveMemorySpace() noexcept
+{
+    if (!initialized_) {
+        BM_LOG_ERROR("the object is not initialized, please check whether Initialize is called.");
+        return BM_NOT_INITIALIZED;
+    }
+
+    if (hbmSegment_ != nullptr) {
+        auto ret = hbmSegment_->ReserveMemorySpace(&hbmGva_);
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("Failed to reserver HBM memory space ret: " << ret);
+            return ret;
+        }
+        if (dataOperator_) {
+            dataOperator_->UpdateGvaSpace(HYBM_MEM_TYPE_DEVICE, (uint64_t)hbmGva_, options_.maxHBMSize,
+                                          options_.rankCount);
+        }
+    }
+
+    if (dramSegment_ != nullptr) {
+        auto ret = dramSegment_->ReserveMemorySpace(&dramGva_);
+        if (ret != BM_OK) {
+            UnReserveMemorySpace();
+            BM_LOG_ERROR("Failed to reserver DRAM memory space ret: " << ret);
+            return ret;
+        }
+        if (dataOperator_) {
+            dataOperator_->UpdateGvaSpace(HYBM_MEM_TYPE_HOST, (uint64_t)dramGva_, options_.maxDRAMSize,
+                                          options_.rankCount);
+        }
+    }
+
+    return BM_OK;
+}
+
+int32_t MemEntityDefault::UnReserveMemorySpace() noexcept
+{
+    if (!initialized_) {
+        return BM_OK;
+    }
+
+    if (hbmSegment_ != nullptr) {
+        hbmSegment_->UnReserveMemorySpace();
+    }
+    if (dramSegment_ != nullptr) {
+        dramSegment_->UnReserveMemorySpace();
+    }
+    return BM_OK;
+}
+
+int32_t MemEntityDefault::AllocLocalMemory(uint64_t size, hybm_mem_type mType, uint32_t flags,
+                                           hybm_mem_slice_t &slice) noexcept
+{
+    if (!initialized_) {
+        BM_LOG_ERROR("the object is not initialized, please check whether Initialize is called.");
+        return BM_NOT_INITIALIZED;
+    }
+
+    if ((size % HYBM_LARGE_PAGE_SIZE) != 0) {
+        BM_LOG_ERROR("allocate memory size: " << size << " invalid, page size is: " << HYBM_LARGE_PAGE_SIZE);
+        return BM_INVALID_PARAM;
+    }
+
+    auto segment = mType == HYBM_MEM_TYPE_DEVICE ? hbmSegment_ : dramSegment_;
+    if (segment == nullptr) {
+        BM_LOG_ERROR("allocate memory with mType: " << mType << ", no segment.");
+        return BM_INVALID_PARAM;
+    }
+
+    MemSlicePtr realSlice;
+    Result ret = BM_OK;
+    FIP_START(ALLOC_LOCAL_MEMORY, &ret)
+    ret = segment->AllocLocalMemory(size, realSlice);
+    FIP_END;
+    if (ret != 0) {
+        BM_LOG_ERROR("segment allocate slice with size: " << size << " failed: " << ret);
+        return ret;
+    }
+
+    slice = realSlice->ConvertToId();
+    transport::TransportMemoryRegion info;
+    info.addr = realSlice->vAddress_;
+    info.size = realSlice->size_;
+    info.flags =
+        segment->GetMemoryType() == HYBM_MEM_TYPE_DEVICE ? transport::REG_MR_FLAG_HBM : transport::REG_MR_FLAG_DRAM;
+    constexpr auto deviceTransportMask = HYBM_DOP_TYPE_DEVICE_RDMA | HYBM_DOP_TYPE_DEVICE_URMA;
+    const bool skipHostShmDeviceRegistration = mType == HYBM_MEM_TYPE_HOST &&
+                                               (options_.bmDataOpType & HYBM_DOP_TYPE_HOST_SHM) != 0U &&
+                                               (options_.bmDataOpType & deviceTransportMask) != 0U;
+    if (skipHostShmDeviceRegistration) {
+        BM_LOG_DEBUG("Skip host shm DRAM registration for device transport, rankId:" << options_.rankId
+                                                                                     << " size:" << size);
+    }
+    if (transportManager_ != nullptr && size > 0 && !skipHostShmDeviceRegistration &&
+        !(options_.bmDataOpType & HYBM_DOP_TYPE_AIV_SDMA)) {
+        ret = transportManager_->RegisterMemoryRegion(info);
+        if (ret != 0) {
+            BM_LOG_ERROR("register memory region allocate failed: " << ret << ", info: " << info);
+            auto res = segment->ReleaseSliceMemory(realSlice);
+            if (res != BM_OK) {
+                BM_LOG_ERROR("failed to release slice memory: " << res);
+            }
+            return ret;
+        }
+    }
+
+    return UpdateHybmDeviceInfo(0);
+}
+
+Result MemEntityDefault::RetainHostMemory(const void *address, uint64_t size) noexcept
+{
+    try {
+        std::shared_ptr<void> owner;
+        const auto ret = MemSegment::RetainHostMemory(address, size, owner);
+        if (ret != BM_OK || !owner) {
+            return ret;
+        }
+        std::lock_guard<std::mutex> lock(managedAllocationsMutex_);
+        managedAllocations_.emplace(owner.get(), owner);
+        return BM_OK;
+    } catch (const std::exception &error) {
+        BM_LOG_ERROR("Retain Fabric Host allocation failed, entityId: " << id_ << " size_bytes: " << size
+                                                                        << " reason: " << error.what());
+        return BM_MALLOC_FAILED;
+    }
+}
+
+int32_t MemEntityDefault::RegisterLocalMemory(const void *ptr, uint64_t size, uint32_t flags,
+                                              hybm_mem_slice_t &slice) noexcept
+{
+    if (ptr == nullptr || size == 0 || size > TB) {
+        BM_LOG_ERROR("input ptr or size(" << size << ") is invalid");
+        return BM_INVALID_PARAM;
+    }
+
+    auto addr = static_cast<uint64_t>(reinterpret_cast<ptrdiff_t>(ptr));
+    std::shared_ptr<MemSegment> segment = nullptr;
+    if (options_.scene == HYBM_SCENE_TRANS || dramSegment_ == nullptr) {
+        segment = hbmSegment_;
+    } else {
+        segment = dramSegment_;
+    }
+    BM_VALIDATE_RETURN(segment != nullptr, "address for segment is null.", BM_INVALID_PARAM);
+
+    auto ret = RetainHostMemory(ptr, size);
+    if (ret != BM_OK) {
+        return ret;
+    }
+    MemSlicePtr realSlice;
+    ret = segment->RegisterMemory(ptr, size, realSlice);
+    if (ret != 0) {
+        BM_LOG_ERROR("segment register slice with size: " << size << " failed: " << ret);
+        return ret;
+    }
+
+    bool isHbm = realSlice->GetMemoryType() == HYBM_MEM_TYPE_DEVICE;
+    BM_LOG_DEBUG("Hbm: " << isHbm << std::hex << ", addrs: 0x" << addr);
+
+    if (transportManager_ != nullptr) {
+        transport::TransportMemoryRegion mr;
+        // Transport managers use HVA as the registration key. Device RDMA obtains DVA from VaManager when needed;
+        // pure SDMA does not register an MR here.
+        mr.addr = realSlice->vAddress_;
+        mr.size = realSlice->size_;
+        mr.flags = (isHbm ? transport::REG_MR_FLAG_HBM : transport::REG_MR_FLAG_DRAM);
+        ret = transportManager_->RegisterMemoryRegion(mr);
+        if (ret != 0) {
+            BM_LOG_ERROR("register MR: " << mr << " to transport failed: " << ret);
+            auto relRet = segment->ReleaseSliceMemory(realSlice);
+            if (relRet != BM_OK) {
+                BM_LOG_ERROR("rollback ReleaseSliceMemory after MR register failed, ret:" << relRet);
+            }
+            return ret;
+        }
+    }
+
+    slice = realSlice->ConvertToId();
+    return BM_OK;
+}
+
+int32_t MemEntityDefault::FreeLocalMemory(hybm_mem_slice_t slice, uint32_t flags) noexcept
+{
+    if (!initialized_) {
+        BM_LOG_ERROR("the object is not initialized, please check whether Initialize is called.");
+        return BM_INVALID_PARAM;
+    }
+    HybmVaManager::GetInstance().DumpReservedGvaInfo();
+    HybmVaManager::GetInstance().DumpAllocatedGvaInfo();
+    MemSlicePtr memSlice;
+    bool fromHbm = false;
+    if (hbmSegment_ != nullptr && (memSlice = hbmSegment_->GetMemSlice(slice, true)) != nullptr) {
+        fromHbm = true;
+    } else if (dramSegment_ != nullptr && (memSlice = dramSegment_->GetMemSlice(slice)) != nullptr) {
+        fromHbm = false;
+    } else {
+        memSlice = nullptr;
+    }
+
+    if (memSlice == nullptr) {
+        BM_LOG_ERROR("FreeLocalMemory: cannot resolve slice id="
+                     << slice << ", neither hbmSegment_ nor dramSegment_ owns it; VaManager entry may leak");
+        return BM_OK;
+    }
+
+    if (transportManager_ != nullptr && !(options_.bmDataOpType & HYBM_DOP_TYPE_AIV_SDMA)) {
+        auto ret = transportManager_->UnregisterMemoryRegion(memSlice->vAddress_);
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("UnregisterMemoryRegion failed, please check input slice.");
+        }
+    }
+
+    Result relRet = BM_OK;
+    if (fromHbm) {
+        relRet = hbmSegment_->ReleaseSliceMemory(memSlice);
+    } else {
+        relRet = dramSegment_->ReleaseSliceMemory(memSlice);
+    }
+    if (relRet != BM_OK) {
+        BM_LOG_ERROR("ReleaseSliceMemory failed, ret:" << relRet);
+    }
+    return BM_OK;
+}
+
+// 按 flags 取 slice 的本地虚拟地址（flags=0）或 GVA（flags=HYBM_GET_SLICE_GVA）
+static void *GetSliceAddrByFlags(const MemSlice &memSlice, uint32_t flags)
+{
+    if (flags == 0U) {
+        return reinterpret_cast<void *>(memSlice.vAddress_);
+    }
+    if (memSlice.gva_ == 0) {
+        BM_LOG_ERROR("slice gva is 0, slice index:" << memSlice.index_ << " memType:" << memSlice.memType_);
+        return nullptr;
+    }
+    return reinterpret_cast<void *>(memSlice.gva_);
+}
+
+void *MemEntityDefault::GetSliceVa(hybm_mem_slice_t slice, uint32_t flags)
+{
+    if (flags != 0U && flags != HYBM_GET_SLICE_GVA) {
+        BM_LOG_ERROR("invalid flags:" << flags << " slice:" << slice);
+        return nullptr;
+    }
+    std::shared_ptr<MemSlice> memSlice;
+    if (hbmSegment_ != nullptr && (memSlice = hbmSegment_->GetMemSlice(slice, true)) != nullptr) {
+        return GetSliceAddrByFlags(*memSlice, flags);
+    } else if (dramSegment_ != nullptr && (memSlice = dramSegment_->GetMemSlice(slice)) != nullptr) {
+        return GetSliceAddrByFlags(*memSlice, flags);
+    }
+
+    BM_LOG_ERROR("failed to get slice va, invalid slice:" << slice);
+    return nullptr;
+}
+
+uint64_t MemEntityDefault::GetSliceSize(hybm_mem_slice_t slice)
+{
+    std::shared_ptr<MemSlice> memSlice;
+    if (hbmSegment_ != nullptr && (memSlice = hbmSegment_->GetMemSlice(slice, true)) != nullptr) {
+        return memSlice->size_;
+    } else if (dramSegment_ != nullptr && (memSlice = dramSegment_->GetMemSlice(slice)) != nullptr) {
+        return memSlice->size_;
+    }
+
+    BM_LOG_ERROR("failed to get slice size, invalid slice:" << slice);
+    return 0;
+}
+
+namespace {
+constexpr size_t kMaxTransportKeyWords = transport::TRANS_KEY_MAX_WORDS;
+
+int AppendEntityExportInfo(ExchangeInfoWriter &desc, const EntityExportInfo &info)
+{
+    int ret = desc.Append(info.magic);
+    ret = (ret != 0) ? ret : desc.Append(info.rankId);
+    ret = (ret != 0) ? ret : desc.Append(info.role);
+    ret = (ret != 0) ? ret : desc.Append(info.reserved);
+    ret = (ret != 0) ? ret : desc.Append(info.nic, sizeof(info.nic));
+    ret = (ret != 0) ? ret : desc.Append(info.layerCount);
+    ret = (ret != 0) ? ret : desc.Append(info.layers, sizeof(info.layers));
+    ret = (ret != 0) ? ret : desc.Append(info.superPodId);
+    ret = (ret != 0) ? ret : desc.Append(info.serverId);
+    ret = (ret != 0) ? ret : desc.Append(info.devicePhyId);
+    ret = (ret != 0) ? ret : desc.Append(info.transportPrivateData.ip, sizeof(info.transportPrivateData.ip));
+    return (ret != 0) ? ret : desc.Append(info.transportPrivateData.key.keys);
+}
+
+int ReadEntityExportInfo(const ExchangeInfoReader &reader, EntityExportInfo &info)
+{
+    int ret = reader.Read(info.magic);
+    ret = (ret != 0) ? ret : reader.Read(info.rankId);
+    ret = (ret != 0) ? ret : reader.Read(info.role);
+    ret = (ret != 0) ? ret : reader.Read(info.reserved);
+    ret = (ret != 0) ? ret : reader.Read(info.nic, sizeof(info.nic));
+    ret = (ret != 0) ? ret : reader.Read(info.layerCount);
+    ret = (ret != 0) ? ret : reader.Read(info.layers, sizeof(info.layers));
+    ret = (ret != 0) ? ret : reader.Read(info.superPodId);
+    ret = (ret != 0) ? ret : reader.Read(info.serverId);
+    ret = (ret != 0) ? ret : reader.Read(info.devicePhyId);
+    ret = (ret != 0) ? ret : reader.Read(info.transportPrivateData.ip, sizeof(info.transportPrivateData.ip));
+    return (ret != 0) ? ret : reader.Read(info.transportPrivateData.key.keys, kMaxTransportKeyWords);
+}
+
+int AppendSliceTransportKey(ExchangeInfoWriter &desc, const SliceExportTransportKey &key)
+{
+    int ret = desc.Append(key.rankId);
+    ret = (ret != 0) ? ret : desc.Append(key.reserved, sizeof(key.reserved));
+    ret = (ret != 0) ? ret : desc.Append(key.address);
+    return (ret != 0) ? ret : desc.Append(key.key.keys);
+}
+
+int ReadSliceTransportKey(const ExchangeInfoReader &reader, SliceExportTransportKey &key)
+{
+    int ret = reader.Read(key.rankId);
+    ret = (ret != 0) ? ret : reader.Read(key.reserved, sizeof(key.reserved));
+    ret = (ret != 0) ? ret : reader.Read(key.address);
+    return (ret != 0) ? ret : reader.Read(key.key.keys, kMaxTransportKeyWords);
+}
+} // namespace
+
+// entityExchangeInfo = entityInfo + segmentInfo
+int32_t MemEntityDefault::ExportEntityExchangeInfo(ExchangeInfoWriter &desc, uint32_t flags) noexcept
+{
+    if (!initialized_) {
+        BM_LOG_ERROR("the object is not initialized, please check whether Initialize is called.");
+        return BM_NOT_INITIALIZED;
+    }
+
+    EntityExportInfo exportInfo{};
+    exportInfo.rankId = options_.rankId;
+    exportInfo.role = static_cast<uint16_t>(options_.role);
+    std::vector<hybm_data_op_type> layerProtocols;
+    if (tagManager_ != nullptr) {
+        layerProtocols = tagManager_->GetLayersForRank(options_.rankId);
+    }
+    if (layerProtocols.size() > EXPORT_INFO_MAX_LAYER_COUNT) {
+        BM_LOG_ERROR("protocol layer count:" << layerProtocols.size() << " exceeds limit:"
+                                             << EXPORT_INFO_MAX_LAYER_COUNT << " rank:" << options_.rankId);
+        return BM_INVALID_PARAM;
+    }
+    exportInfo.layerCount = static_cast<uint32_t>(layerProtocols.size());
+    std::copy(layerProtocols.begin(), layerProtocols.end(), exportInfo.layers);
+    MemSegment::GetLocalPhysicalInfo(exportInfo.superPodId, exportInfo.serverId, exportInfo.devicePhyId);
+    if (transportManager_ != nullptr) {
+        auto &nic = transportManager_->GetNic();
+        if (nic.size() >= sizeof(exportInfo.nic)) {
+            BM_LOG_ERROR("transport get nic(" << nic << ") too long.");
+            return BM_ERROR;
+        }
+        size_t copyLen = std::min(nic.size(), sizeof(exportInfo.nic));
+        std::copy_n(nic.c_str(), copyLen, exportInfo.nic);
+        const auto privateData = transportManager_->GetPrivateData();
+        exportInfo.transportPrivateData = privateData;
+        BM_LOG_DEBUG("transport get nic:" << nic << ", ip: " << privateData.ip);
+    }
+    auto ret = AppendEntityExportInfo(desc, exportInfo);
+    if (ret != 0) {
+        BM_LOG_ERROR("export entity exchange info failed: " << ret);
+        return BM_ERROR;
+    }
+
+    if (hbmSegment_ == nullptr) {
+        if (options_.scene == HYBM_SCENE_TRANS) {
+            BM_LOG_ERROR("hbm segment is null, failed to export segment info in trans scene");
+            return BM_ERROR;
+        } else {
+            BM_LOG_DEBUG("hbm segment is null, skip export segment info");
+            return BM_OK;
+        }
+    }
+
+    std::string segInfo;
+    ret = hbmSegment_->Export(segInfo);
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("failed to export segment info in trans scene, ret: " << ret);
+        return BM_ERROR;
+    }
+    ret = desc.Append(segInfo.data(), segInfo.size());
+    if (ret != 0) {
+        BM_LOG_ERROR("export to string wrong size: " << segInfo.size());
+        return BM_ERROR;
+    }
+    return BM_OK;
+}
+
+// sliceExchangeInfo = segmentInfo + transportInfo
+int32_t MemEntityDefault::ExportSliceExchangeInfo(hybm_mem_slice_t slice, ExchangeInfoWriter &desc,
+                                                  uint32_t flags) noexcept
+{
+    BM_ASSERT_LOG_AND_RETURN(initialized_, "the entity is not initialized", BM_NOT_INITIALIZED);
+    if (flags & HYBM_FLAG_EXPORT_ENTITY) {
+        return ExportEntityExchangeInfo(desc, flags);
+    }
+
+    uint64_t exportMagic = 0;
+    std::string info;
+    MemSlicePtr realSlice;
+    std::shared_ptr<MemSegment> currentSegment;
+    if (hbmSegment_ != nullptr) {
+        realSlice = hbmSegment_->GetMemSlice(slice, true);
+        currentSegment = hbmSegment_;
+    }
+    if (realSlice == nullptr && dramSegment_ != nullptr) {
+        realSlice = dramSegment_->GetMemSlice(slice);
+        currentSegment = dramSegment_;
+    }
+    if (realSlice == nullptr) {
+        BM_LOG_ERROR("cannot find input slice for export.");
+        return BM_INVALID_PARAM;
+    }
+
+    auto ret = currentSegment->Export(realSlice, info);
+    if (ret != 0) {
+        BM_LOG_ERROR("export to string failed: " << ret);
+        return ret;
+    }
+    // 导出块首 8 字节即段内写入的 magic（与 Import 端 demux 约定一致），据此填充 transport key；
+    // asymmetric 段统一写 USER_MEM magic，池内 HBM/DRAM 段写各自 magic，无需按介质分支
+    if (info.size() >= sizeof(exportMagic)) {
+        std::memcpy(&exportMagic, info.data(), sizeof(exportMagic));
+    }
+    ret = desc.Append(info.data(), info.size());
+    if (ret != 0) {
+        BM_LOG_ERROR("export to string wrong size: " << info.size());
+        return BM_ERROR;
+    }
+
+    SliceExportTransportKey transportKey{exportMagic, options_.rankId, realSlice->gva_};
+    if (transportManager_ != nullptr && !(options_.bmDataOpType & HYBM_DOP_TYPE_AIV_SDMA)) {
+        if (realSlice->size_ > 0) {
+            ret = transportManager_->QueryMemoryKey(realSlice->vAddress_, transportKey.key);
+            if (ret != 0) {
+                BM_LOG_WARN("query memory key failed, export zero key. addr: 0x" << std::hex << realSlice->vAddress_
+                                                                                 << std::dec << ", ret: " << ret);
+                transportKey.key = {};
+            } else {
+                const uint64_t sliceGva = realSlice->gva_;
+                if (sliceGva != 0) {
+                    // trans scene: the slice already holds the paired GVA, so overwrite the address inside the key
+                    // directly. A peer-side reverse HVA lookup would otherwise yield an "owner GVA" differing from
+                    // the local rebuilt GVA sent by the data plane. Non-trans segments have gva_ == 0, a no-op there.
+                    transportManager_->UpdateMemoryKey(transportKey.key,
+                                                       reinterpret_cast<void *>(static_cast<uintptr_t>(sliceGva)));
+                }
+            }
+        }
+        ret = AppendSliceTransportKey(desc, transportKey);
+        if (ret != 0) {
+            BM_LOG_ERROR("append transport key failed: " << ret);
+            return ret;
+        }
+    }
+
+    if (options_.scene != HYBM_SCENE_TRANS) {
+        BM_LOG_DEBUG("Success to export slice rankId:" << transportKey.rankId << " addr:" << transportKey.address
+                                                       << " key:" << transportKey.key);
+    } else {
+        BM_LOG_DEBUG("Success to export slice rankId:" << options_.rankId << " addr:" << realSlice->vAddress_);
+    }
+    return BM_OK;
+}
+
+int32_t MemEntityDefault::ImportForSegment(const ExchangeInfoReader desc[], uint32_t count, void *addresses[],
+                                           uint32_t overrideRank) noexcept
+{
+    if (desc[0].LeftBytes() == 0) {
+        BM_LOG_DEBUG("no segment need import.");
+        return BM_OK;
+    }
+
+    std::vector<std::string> dramInfos;
+    std::vector<std::string> userSegInfos;
+    std::vector<uint32_t> dramIndex;
+    std::vector<uint32_t> userSegIndex;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t magic;
+        if (desc[i].Test(magic) < 0) {
+            BM_LOG_ERROR("left import data no magic size. idx:" << i);
+            return BM_OK;
+        }
+
+        char tmp[UNIFIED_EXCHANGE_SEG_INFO_SIZE];
+        if (IsDramSlice(magic)) {
+            desc[i].Read(reinterpret_cast<void *>(tmp), UNIFIED_EXCHANGE_SEG_INFO_SIZE);
+            dramInfos.emplace_back(tmp, UNIFIED_EXCHANGE_SEG_INFO_SIZE);
+            dramIndex.emplace_back(i);
+        } else if (IsHbmSlice(magic) || IsUserSlice(magic)) {
+            desc[i].Read(reinterpret_cast<void *>(tmp), UNIFIED_EXCHANGE_SEG_INFO_SIZE);
+            userSegInfos.emplace_back(tmp, UNIFIED_EXCHANGE_SEG_INFO_SIZE);
+            userSegIndex.emplace_back(i);
+        }
+    }
+
+    if (!dramInfos.empty()) {
+        std::vector<void *> dramAddrs(dramInfos.size(), nullptr);
+        BM_ASSERT_LOG_AND_RETURN(dramSegment_ != nullptr, "dramSegment is nullptr", BM_ERROR);
+        auto ret = dramSegment_->Import(dramInfos, dramAddrs.data(), overrideRank);
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("dram segment import infos failed: " << ret);
+            return ret;
+        }
+        if (addresses != nullptr) {
+            for (uint32_t i = 0; i < dramInfos.size(); i++) {
+                addresses[dramIndex[i]] = dramAddrs[i];
+            }
+        }
+    }
+
+    if (!userSegInfos.empty()) {
+        std::vector<void *> userSegAddrs(userSegInfos.size(), nullptr);
+        BM_ASSERT_LOG_AND_RETURN(hbmSegment_ != nullptr, "hbmSegment is nullptr", BM_ERROR);
+        auto ret = hbmSegment_->Import(userSegInfos, userSegAddrs.data(), overrideRank);
+        if (ret != BM_OK) {
+            // P2P 未就绪是可重试的瞬时状态，根因已在 segment 层记 WARN，这里不重复打印
+            if (ret != BM_P2P_NOT_READY) {
+                BM_LOG_ERROR("hbm segment import infos failed: " << ret);
+            }
+            return ret;
+        }
+        if (addresses != nullptr) {
+            for (uint32_t i = 0; i < userSegInfos.size(); i++) {
+                addresses[userSegIndex[i]] = userSegAddrs[i];
+            }
+        }
+    }
+    return BM_OK;
+}
+
+int32_t MemEntityDefault::ImportSliceExchangeInfo(const ExchangeInfoReader desc[], uint32_t count, void *addresses[],
+                                                  uint32_t flags) noexcept
+{
+    if (!initialized_) {
+        BM_LOG_ERROR("the object is not initialized, please check whether Initialize is called.");
+        return BM_NOT_INITIALIZED;
+    }
+
+    auto ret = SetThreadAclDevice();
+    if (ret != BM_OK) {
+        return BM_ERROR;
+    }
+
+    if (desc == nullptr) {
+        BM_LOG_ERROR("the input desc is nullptr.");
+        return BM_ERROR;
+    }
+
+    // trans 场景 rank 覆盖：flags 中解码本地分配的覆盖 rank，0 表示不覆盖
+    const uint32_t overrideRank =
+        HYBM_IMPORT_RANK_ENABLED(flags) ? HYBM_IMPORT_RANK_DECODE(flags) : HYBM_IMPORT_RANK_INVALID;
+
+    ret = ImportForSegment(desc, count, addresses, overrideRank);
+    if (ret != BM_OK) {
+        return ret;
+    }
+
+    // transport要在segment之后import
+    if (transportManager_ != nullptr && !(options_.bmDataOpType & HYBM_DOP_TYPE_AIV_SDMA)) {
+        ret = ImportForTransportPrecheck(desc, count, addresses, overrideRank);
+        if (ret != BM_OK) {
+            return ret;
+        }
+
+        ret = ImportForTransport();
+        if (ret != BM_OK) {
+            return ret;
+        }
+    }
+
+    return BM_OK;
+}
+
+int32_t MemEntityDefault::ImportForLayerProtocols()
+{
+    const auto localLayers = tagManager_->GetLayersForRank(options_.rankId);
+    const uint32_t localCount = static_cast<uint32_t>(localLayers.size());
+    for (const auto &item : importedRanks_) {
+        const auto rankId = item.first;
+        const auto &info = item.second;
+        if (info.layerCount != localCount) {
+            BM_LOG_ERROR("tag info template mismatch, local rank:" << options_.rankId << " localLayerCount:"
+                                                                   << localCount << " peer rank:" << rankId
+                                                                   << " peerLayerCount:" << info.layerCount);
+            return BM_INVALID_PARAM;
+        }
+        if (info.layerCount == 0U) {
+            continue;
+        }
+        if (info.layerCount > EXPORT_INFO_MAX_LAYER_COUNT) {
+            BM_LOG_ERROR("peer layer count:" << info.layerCount << " exceeds limit:" << EXPORT_INFO_MAX_LAYER_COUNT
+                                             << " local rank:" << options_.rankId << " peer rank:" << rankId);
+            return BM_INVALID_PARAM;
+        }
+        const std::vector<hybm_data_op_type> layers(info.layers, info.layers + info.layerCount);
+        auto ret = tagManager_->AddRankLayers(rankId, layers);
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("Failed to add rank layers, rankId:" << rankId << " layerCount:" << info.layerCount);
+            return ret;
+        }
+    }
+    return BM_OK;
+}
+
+int32_t MemEntityDefault::ConnectTransport(const uint32_t *ranks, uint32_t count, uint32_t flags) noexcept
+{
+    (void)flags;
+    if (!initialized_) {
+        BM_LOG_ERROR("the object is not initialized");
+        return BM_NOT_INITIALIZED;
+    }
+    if (transportManager_ == nullptr || (options_.bmDataOpType & HYBM_DOP_TYPE_AIV_SDMA)) {
+        return BM_OK;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        auto ret = transportManager_->ConnectRank(ranks[i]);
+        if (dataOperator_ != nullptr) {
+            const auto connectedProtocols = transportManager_->GetConnectedProtocols(ranks[i]);
+            dataOperator_->CacheRankProtocols(ranks[i], connectedProtocols);
+        }
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("Failed to connect transport, rankId:" << ranks[i] << ", ret:" << ret);
+            return ret;
+        }
+    }
+    return BM_OK;
+}
+
+int32_t MemEntityDefault::ImportForTransportManager()
+{
+    if (transportManager_ == nullptr || (options_.bmDataOpType & HYBM_DOP_TYPE_AIV_SDMA)) {
+        BM_LOG_DEBUG("no transport, no need import.");
+        return BM_OK;
+    }
+    int32_t ret = BM_ERROR;
+    transport::HybmTransPrepareOptions prepareOptions;
+    for (const auto &item : importedRanks_) {
+        auto &info = item.second;
+        if (options_.role != HYBM_ROLE_PEER && static_cast<hybm_role_type>(info.role) == options_.role) {
+            continue;
+        }
+        transport::TransportRankPrepareInfo prepareInfo;
+        prepareInfo.nic = info.nic;
+        prepareInfo.privateData = info.transportPrivateData;
+        prepareInfo.role = static_cast<hybm_role_type>(info.role);
+        prepareInfo.superPodId = info.superPodId;
+        prepareInfo.serverId = info.serverId;
+        prepareInfo.devicePhyId = info.devicePhyId;
+        prepareOptions.options.emplace(info.rankId, std::move(prepareInfo));
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(transportMutex_);
+        if (transportPrepared_) {
+            ret = transportManager_->UpdateRankOptions(prepareOptions);
+        } else {
+            ret = transportManager_->Prepare(prepareOptions);
+            if (ret != BM_OK) {
+                BM_LOG_ERROR("Failed to prepare transport connect data, ret: " << ret);
+                return ret;
+            }
+            transportPrepared_ = true;
+        }
+    }
+
+    BM_ASSERT_LOG_AND_RETURN(ret == BM_OK, "Failed to Connect transport: " << ret, ret);
+    return 0;
+}
+
+int32_t MemEntityDefault::ImportEntityExchangeInfo(const ExchangeInfoReader desc[], uint32_t count,
+                                                   uint32_t flags) noexcept
+{
+    BM_ASSERT_LOG_AND_RETURN(initialized_, "initialized_ = " << initialized_, BM_NOT_INITIALIZED);
+    BM_ASSERT_LOG_AND_RETURN(desc != nullptr, "desc is nullptr", BM_INVALID_PARAM);
+    BM_ASSERT_LOG_AND_RETURN(SetThreadAclDevice() == BM_OK, "SetThreadAclDevice failed", BM_ERROR);
+
+    // trans 场景 rank 覆盖：flags 使能时用导入方本地按对端分配的 rank 替换导出端 entity rank，
+    // 无效值（UINT32_MAX）表示不覆盖
+    const uint32_t overrideRank =
+        HYBM_IMPORT_RANK_ENABLED(flags) ? HYBM_IMPORT_RANK_DECODE(flags) : HYBM_IMPORT_RANK_INVALID;
+
+    std::vector<EntityExportInfo> deserializedInfos(count);
+    for (auto i = 0U; i < count; i++) {
+        auto ret = ReadEntityExportInfo(desc[i], deserializedInfos[i]);
+        if (ret != 0) {
+            BM_LOG_ERROR("deserialize imported info(" << i << ") failed.");
+            return BM_INVALID_PARAM;
+        }
+        if (overrideRank != HYBM_IMPORT_RANK_INVALID) {
+            deserializedInfos[i].rankId = overrideRank;
+        }
+    }
+    {
+        std::unique_lock<std::mutex> uniqueLock{importMutex_};
+        for (auto &deserializedInfo : deserializedInfos) {
+            importedRanks_[deserializedInfo.rankId] = deserializedInfo;
+        }
+    }
+    BM_ASSERT_LOG_AND_RETURN(ImportForLayerProtocols() == BM_OK, "Failed import for layer protocols", BM_ERROR);
+    BM_ASSERT_LOG_AND_RETURN(ImportForTransportManager() == BM_OK, "Failed import for transport manager", BM_ERROR);
+
+    if (hbmSegment_ == nullptr) {
+        if (options_.scene == HYBM_SCENE_TRANS) {
+            BM_LOG_ERROR("hbm segment is null, failed to import segment info in trans scene");
+            return BM_ERROR;
+        }
+        return BM_OK;
+    }
+
+    std::vector<std::string> infos;
+    for (auto i = 0U; i < count; i++) {
+        if (desc[i].LeftBytes() > 0) {
+            infos.emplace_back(desc[i].LeftToString());
+        }
+    }
+    if (infos.size() > 0) {
+        auto ret = hbmSegment_->Import(infos, nullptr, overrideRank);
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("failed to import segment info, ret: " << ret);
+            return BM_ERROR;
+        }
+    }
+    return BM_OK;
+}
+
+int32_t MemEntityDefault::SetExtraContext(const void *context, uint32_t size) noexcept
+{
+    if (!initialized_) {
+        BM_LOG_ERROR("the object is not initialized, please check whether Initialize is called.");
+        return BM_NOT_INITIALIZED;
+    }
+
+    BM_ASSERT_LOG_AND_RETURN(context != nullptr, "context is nullptr", BM_INVALID_PARAM);
+    if (size > HYBM_DEVICE_USER_CONTEXT_PRE_SIZE) {
+        BM_LOG_ERROR("set extra context failed, context size is too large: " << size << " limit: "
+                                                                             << HYBM_DEVICE_USER_CONTEXT_PRE_SIZE);
+        return BM_INVALID_PARAM;
+    }
+
+    uint64_t addr = HYBM_DEVICE_USER_CONTEXT_ADDR + id_ * HYBM_DEVICE_USER_CONTEXT_PRE_SIZE;
+    auto ret = DlAclApi::AclrtMemcpy((void *)addr, HYBM_DEVICE_USER_CONTEXT_PRE_SIZE, context, size,
+                                     ACL_MEMCPY_HOST_TO_DEVICE);
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("memcpy user context failed, ret: " << ret);
+        return BM_ERROR;
+    }
+
+    return UpdateHybmDeviceInfo(size);
+}
+
+void MemEntityDefault::Unmap() noexcept
+{
+    if (!initialized_) {
+        BM_LOG_ERROR("the object is not initialized, please check whether Initialize is called.");
+        return;
+    }
+
+    if (hbmSegment_ != nullptr) {
+        hbmSegment_->Unmap();
+    }
+    if (dramSegment_ != nullptr) {
+        dramSegment_->Unmap();
+    }
+}
+
+int32_t MemEntityDefault::Mmap() noexcept
+{
+    if (!initialized_) {
+        BM_LOG_ERROR("the object is not initialized, please check whether Initialize is called.");
+        return BM_NOT_INITIALIZED;
+    }
+
+    // in trans scene, two segement work togather, but hbm do not need to mmap, and wrongly mmap will make dram mmap
+    // fail
+    if (hbmSegment_ != nullptr && options_.scene != HYBM_SCENE_TRANS) {
+        auto ret = hbmSegment_->Mmap();
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("hbmSegment_->Mmap() failed, ret: " << ret << " entityId: " << id_);
+            return ret;
+        }
+    }
+
+    if (dramSegment_ != nullptr) {
+        auto ret = dramSegment_->Mmap();
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("dramSegment_->Mmap() failed, ret: " << ret << " entityId: " << id_);
+            return ret;
+        }
+    }
+
+    return BM_OK;
+}
+
+int32_t MemEntityDefault::UnmapRank(uint32_t rankId) noexcept
+{
+    if (!initialized_) {
+        BM_LOG_ERROR("the object is not initialized");
+        return BM_NOT_INITIALIZED;
+    }
+    if (transportManager_ != nullptr) {
+        std::vector<uint32_t> ranks = {rankId};
+        auto ret = transportManager_->RemoveRanks(ranks);
+        if (ret != BM_OK) {
+            BM_LOG_WARN("transport remove ranks failed for rank " << rankId << " ret: " << ret);
+        }
+    }
+    if (hbmSegment_ != nullptr) {
+        auto ret = hbmSegment_->RemoveImported({rankId});
+        if (ret != BM_OK) {
+            BM_LOG_WARN("hbm unmap rank " << rankId << " failed: " << ret);
+        }
+    }
+    if (dramSegment_ != nullptr) {
+        auto ret = dramSegment_->RemoveImported({rankId});
+        if (ret != BM_OK) {
+            BM_LOG_WARN("dram unmap rank " << rankId << " failed: " << ret);
+        }
+    }
+    if (tagManager_ != nullptr) {
+        tagManager_->RemoveRankInfo(rankId);
+    }
+    {
+        std::unique_lock<std::mutex> lock{importMutex_};
+        importedRanks_.erase(rankId);
+        importedMemories_.erase(rankId);
+    }
+    return BM_OK;
+}
+
+int32_t MemEntityDefault::RemoveImported(const std::vector<uint32_t> &ranks) noexcept
+{
+    if (!initialized_) {
+        BM_LOG_ERROR("the object is not initialized, please check whether Initialize is called.");
+        return BM_NOT_INITIALIZED;
+    }
+
+    if (transportManager_ != nullptr) {
+        auto ret = transportManager_->RemoveRanks(ranks);
+        if (ret != BM_OK) {
+            BM_LOG_WARN("unable to transport remove ranks : " << ret);
+        }
+    }
+
+    if (hbmSegment_ != nullptr) {
+        auto ret = hbmSegment_->RemoveImported(ranks);
+        if (ret != BM_OK) {
+            return ret;
+        }
+    }
+
+    if (dramSegment_ != nullptr) {
+        auto ret = dramSegment_->RemoveImported(ranks);
+        if (ret != BM_OK) {
+            return ret;
+        }
+    }
+
+    if (dataOperator_ != nullptr) {
+        dataOperator_->CleanUp();
+    }
+
+    if (tagManager_ != nullptr) {
+        for (auto rank : ranks) {
+            tagManager_->RemoveRankInfo(rank);
+        }
+    }
+
+    {
+        std::unique_lock<std::mutex> uniqueLock{importMutex_};
+        for (auto rank : ranks) {
+            importedRanks_.erase(rank);
+            importedMemories_.erase(rank);
+        }
+    }
+
+    return BM_OK;
+}
+
+int32_t MemEntityDefault::CopyData(hybm_copy_params &params, hybm_data_copy_direction direction, void *stream,
+                                   uint32_t flags) noexcept
+{
+    if (!initialized_) {
+        BM_LOG_ERROR("the object is not initialized, please check whether Initialize is called.");
+        return BM_NOT_INITIALIZED;
+    }
+    auto ret = SetThreadAclDevice();
+    BM_ASSERT_LOG_AND_RETURN(ret == BM_OK, "ret = " << ret, BM_ERROR);
+
+    ret = BM_OK;
+    std::pair<uint32_t, uint32_t> p2pInfo;
+    ret = LocateAddrAndRank(params.src, params.dest, p2pInfo);
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("failed to locate addr and rank, ret:" << ret << ", src:" << VaToStr(params.src) << ", dest:"
+                                                            << VaToStr(params.dest) << ", size:" << params.dataSize);
+        return ret;
+    }
+    ExtOptions options{};
+    options.flags = flags;
+    options.stream = stream;
+    options.srcRankId = p2pInfo.first;
+    options.destRankId = p2pInfo.second;
+
+    ret = dataOperator_->DataCopy(params, direction, options);
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("failed to copy data ret:" << ret << ", src:" << VaToStr(params.src)
+                                                << ", dest:" << VaToStr(params.dest) << ", size:" << params.dataSize);
+    }
+    return ret;
+}
+
+int32_t MemEntityDefault::BatchCopyData(hybm_batch_copy_params &params, hybm_data_copy_direction direction,
+                                        void *stream, uint32_t flags) noexcept
+{
+    if (!initialized_) {
+        BM_LOG_ERROR("the object is not initialized, please check whether Initialize is called.");
+        return BM_NOT_INITIALIZED;
+    }
+    auto ret = SetThreadAclDevice();
+    BM_ASSERT_LOG_AND_RETURN(ret == BM_OK, "ret = " << ret, BM_ERROR);
+
+    ret = BM_ERROR;
+    if (dataOperator_ == nullptr) {
+        BM_LOG_ERROR("Data copy failed, dataOperator_ is null.");
+        return ret;
+    }
+
+    ExtOptions sOptions{};
+    sOptions.stream = stream;
+    sOptions.flags = flags;
+    // 将所有地址按srcRank - dstRank分组，并且转换地址
+    TP_TRACE_BEGIN(TP_HYBM_BATCH_BUILD_GROUP_MAP);
+    for (uint32_t i = 0; i < params.batchSize; ++i) {
+        std::pair<uint32_t, uint32_t> p2pInfo;
+        ret = LocateAddrAndRank(params.sources[i], params.destinations[i], p2pInfo);
+        if (ret != BM_OK) {
+            TP_TRACE_END(TP_HYBM_BATCH_BUILD_GROUP_MAP, ret);
+            BM_LOG_ERROR("failed to locate addr and rank, ret:"
+                         << ret << ", index:" << i << ", src:" << VaToStr(params.sources[i])
+                         << ", dest:" << VaToStr(params.destinations[i]) << ", size:" << params.dataSizes[i]);
+            return ret;
+        }
+        BM_LOG_DEBUG("source:" << VaToStr(params.sources[i]) << " destination:" << VaToStr(params.destinations[i])
+                               << " dataSize:" << params.dataSizes[i]);
+        sOptions.groupMap[p2pInfo].push_back(i);
+    }
+    TP_TRACE_END(TP_HYBM_BATCH_BUILD_GROUP_MAP, BM_OK);
+
+    BM_LOG_DEBUG("BatchDataCopy: localRank=" << options_.rankId << ", batchSize=" << params.batchSize << ", direction="
+                                             << direction << ", groupNum=" << sOptions.groupMap.size());
+    TP_TRACE_BEGIN(TP_HYBM_BATCH_DISPATCH_DATA_OP);
+    ret = dataOperator_->BatchDataCopy(params, direction, sOptions);
+    TP_TRACE_END(TP_HYBM_BATCH_DISPATCH_DATA_OP, ret);
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("Data copy failed, ret: " << ret);
+        return ret;
+    }
+    return ret;
+}
+
+int32_t MemEntityDefault::Wait() noexcept
+{
+    if (!initialized_) {
+        BM_LOG_ERROR("the object is not initialized, please check whether Initialize is called.");
+        return BM_NOT_INITIALIZED;
+    }
+    return dataOperator_->Wait(0);
+}
+
+int MemEntityDefault::CheckOptions(const hybm_options *options) noexcept
+{
+    if (options == nullptr) {
+        BM_LOG_ERROR("initialize with nullptr.");
+        return BM_INVALID_PARAM;
+    }
+
+    if (options->rankId >= options->rankCount) {
+        BM_LOG_ERROR("local rank id: " << options->rankId << " invalid, total is " << options->rankCount);
+        return BM_INVALID_PARAM;
+    }
+
+    constexpr uint32_t deviceNetworkProtocolMask = HYBM_DOP_TYPE_DEVICE_RDMA | HYBM_DOP_TYPE_DEVICE_URMA;
+    const uint32_t enabledDeviceNetworkProtocols = options->bmDataOpType & deviceNetworkProtocolMask;
+    // 只允许启用一种协议
+    if (enabledDeviceNetworkProtocols != 0U &&
+        (enabledDeviceNetworkProtocols & (enabledDeviceNetworkProtocols - 1U)) != 0U) {
+        BM_LOG_ERROR("device network protocols conflict: rankId=" << options->rankId
+                                                                  << " bmDataOpType=" << options->bmDataOpType);
+        return BM_INVALID_PARAM;
+    }
+
+    if ((options->bmDataOpType & HYBM_DOP_TYPE_HOST_SHM) != 0) {
+        if ((options->memType & HYBM_MEM_TYPE_DEVICE) != 0 || options->deviceVASpace != 0) {
+            BM_LOG_ERROR("HOST_SHM op type only supports DRAM shared memory without HBM");
+            return BM_INVALID_PARAM;
+        }
+        constexpr uint32_t hostShmConflictMask = HYBM_DOP_TYPE_SDMA | HYBM_DOP_TYPE_DEVICE_RDMA |
+                                                 HYBM_DOP_TYPE_DEVICE_URMA | HYBM_DOP_TYPE_HOST_RDMA |
+                                                 HYBM_DOP_TYPE_HOST_TCP | HYBM_DOP_TYPE_HOST_URMA;
+        if ((options->bmDataOpType & hostShmConflictMask) != 0) {
+            BM_LOG_ERROR("HOST_SHM op type does not support mixing with other data op types");
+            return BM_INVALID_PARAM;
+        }
+    }
+    if ((options->flags & HYBM_FLAG_CREATE_WITH_SHM) != 0 && options->dramShmFd < 0) {
+        BM_LOG_ERROR("local rank id: " << options->rankId << ", create with share memory flag set but fd: "
+                                       << options->dramShmFd << " invalid.");
+        return BM_INVALID_PARAM;
+    }
+
+    return BM_OK;
+}
+
+int MemEntityDefault::LoadExtendLibrary() noexcept
+{
+    if (options_.bmDataOpType == HYBM_DOP_TYPE_HOST_SHM) {
+        BM_LOG_DEBUG("HOST_SHM data operator selected, skip loading transport extend libraries.");
+        return BM_OK;
+    }
+
+    if (options_.bmDataOpType & HYBM_DOP_TYPE_DEVICE_RDMA) {
+        auto ret = DlApi::LoadExtendLibrary(DlApiExtendLibraryType::DL_EXT_LIB_DEVICE_RDMA);
+        if (ret != 0) {
+            BM_LOG_ERROR("LoadExtendLibrary for DEVICE RDMA failed: " << ret);
+            return ret;
+        }
+    }
+
+    if (options_.bmDataOpType & HYBM_DOP_TYPE_AIV_SDMA) {
+        auto ret = DlApi::LoadExtendLibrary(DlApiExtendLibraryType::DL_EXT_LIB_DEVICE_SDMA);
+        if (ret != 0) {
+            BM_LOG_ERROR("LoadExtendLibrary for DEVICE SDMA failed: " << ret);
+            return ret;
+        }
+    }
+
+    if (options_.bmDataOpType & HYBM_DOP_TYPE_DEVICE_URMA) {
+        auto ret = DlApi::LoadExtendLibrary(DlApiExtendLibraryType::DL_EXT_LIB_DEVICE_URMA);
+        if (ret != 0) {
+            BM_LOG_ERROR("LoadExtendLibrary for DEVICE URMA failed: " << ret);
+            return ret;
+        }
+    }
+
+    if (options_.bmDataOpType & (HYBM_DOP_TYPE_HOST_RDMA | HYBM_DOP_TYPE_HOST_URMA | HYBM_DOP_TYPE_HOST_TCP)) {
+        auto ret = DlApi::LoadExtendLibrary(DlApiExtendLibraryType::DL_EXT_LIB_HOST_RDMA);
+        if (ret != 0) {
+            BM_LOG_ERROR("LoadExtendLibrary for HOST RDMA failed: " << ret);
+            return ret;
+        }
+    }
+
+    return BM_OK;
+}
+
+int MemEntityDefault::UpdateHybmDeviceInfo(uint32_t extCtxSize) noexcept
+{
+    if (options_.bmType != HYBM_TYPE_AI_CORE_INITIATE) {
+        return BM_OK;
+    }
+
+    HybmDeviceMeta info;
+    auto addr = HYBM_DEVICE_META_ADDR + HYBM_DEVICE_GLOBAL_META_SIZE + id_ * HYBM_DEVICE_PRE_META_SIZE;
+
+    SetHybmDeviceInfo(info);
+    info.extraContextSize = extCtxSize;
+    auto ret = DlAclApi::AclrtMemcpy((void *)addr, HYBM_LARGE_PAGE_SIZE, &info, sizeof(HybmDeviceMeta),
+                                     ACL_MEMCPY_HOST_TO_DEVICE);
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("update hybm info memory failed, ret: " << ret);
+        return BM_ERROR;
+    }
+    return BM_OK;
+}
+
+void MemEntityDefault::SetHybmDeviceInfo(HybmDeviceMeta &info)
+{
+    info.entityId = id_;
+    info.rankId = options_.rankId;
+    info.rankSize = options_.rankCount;
+    info.symmetricSize = options_.maxHBMSize;
+    info.extraContextSize = 0;
+    if (transportManager_ != nullptr) {
+        info.qpInfoAddress = (uint64_t)(ptrdiff_t)transportManager_->GetQpInfo();
+        info.sdmaWorkSpace = transportManager_->GetSdmaWorkSpaceAddr();
+    } else {
+        info.qpInfoAddress = 0UL;
+        info.sdmaWorkSpace = 0UL;
+    }
+}
+
+int32_t MemEntityDefault::ImportForTransportPrecheck(const ExchangeInfoReader desc[], uint32_t &count,
+                                                     void *addresses[], uint32_t overrideRank)
+{
+    int ret = BM_OK;
+    SliceExportTransportKey transportKey;
+    for (auto i = 0U; i < count; i++) {
+        ret = ReadSliceTransportKey(desc[i], transportKey);
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("read info for transport failed: " << ret);
+            return ret;
+        }
+
+        // trans需要更新transportKey中的address
+        if (options_.scene == HYBM_SCENE_TRANS && addresses != nullptr) {
+            transportManager_->UpdateMemoryKey(transportKey.key, addresses[i]);
+        }
+
+        // trans 场景 rank 覆盖：与 entity/segment 导入路径使用同一本地覆盖 rank，
+        // 保证 ImportForTransport 中 importedMemories_ 与 importedRanks_ 的 rank key 对齐
+        const uint32_t rankId = (overrideRank != HYBM_IMPORT_RANK_INVALID) ? overrideRank : transportKey.rankId;
+        {
+            std::unique_lock<std::mutex> uniqueLock{importMutex_};
+            importedMemories_[rankId].insert(transportKey.key);
+        }
+        BM_LOG_DEBUG("Success to import slice rankId:" << transportKey.rankId << " addr:" << std::hex
+                                                       << transportKey.address);
+    }
+    return BM_OK;
+}
+
+int32_t MemEntityDefault::ImportForTransport() noexcept
+{
+    int ret = BM_OK;
+    transport::HybmTransPrepareOptions transOptions;
+    std::unique_lock<std::mutex> uniqueLock{importMutex_};
+    for (auto &rank : importedRanks_) {
+        if (options_.role != HYBM_ROLE_PEER && static_cast<hybm_role_type>(rank.second.role) == options_.role) {
+            continue;
+        }
+
+        transOptions.options[rank.first].role = static_cast<hybm_role_type>(rank.second.role);
+        transOptions.options[rank.first].nic = rank.second.nic;
+        transOptions.options[rank.first].privateData = rank.second.transportPrivateData;
+        BM_LOG_DEBUG("ImportForTransport rankid:" << rank.first);
+    }
+    for (auto &mr : importedMemories_) {
+        auto pos = transOptions.options.find(mr.first);
+        if (pos != transOptions.options.end()) {
+            for (auto &key : mr.second) {
+                pos->second.memKeys.emplace_back(key);
+            }
+        }
+    }
+    uniqueLock.unlock();
+    if (transportManager_ != nullptr) {
+        {
+            std::lock_guard<std::mutex> lock(transportMutex_);
+            if (!transportPrepared_) {
+                ret = transportManager_->Prepare(transOptions);
+                transportPrepared_ = true;
+            } else {
+                ret = transportManager_->UpdateRankOptions(transOptions);
+            }
+        }
+        if (ret != 0) {
+            BM_LOG_ERROR("ImportForTransport failed: " << ret);
+            return ret;
+        }
+    }
+    return BM_OK;
+}
+
+Result MemEntityDefault::LocateAddrAndRank(void *&src, void *&dest, std::pair<uint32_t, uint32_t> &p2pInfo) noexcept
+{
+    // va -> remote rank: resolve by the GVA layout of this entity's segments (gva<->rank is computed by the
+    // segment itself, see MemSegment::FindRemoteRankByVa). A miss means local memory, fall back to options_.rankId.
+    auto resolveRank = [this](uint64_t va) {
+        uint32_t rank = 0;
+        if ((hbmSegment_ != nullptr && hbmSegment_->FindRemoteRankByVa(va, rank)) ||
+            (dramSegment_ != nullptr && dramSegment_->FindRemoteRankByVa(va, rank))) {
+            return rank;
+        }
+        return options_.rankId;
+    };
+
+    p2pInfo.first = resolveRank(reinterpret_cast<uint64_t>(src));
+    p2pInfo.second = resolveRank(reinterpret_cast<uint64_t>(dest));
+
+    BM_LOG_DEBUG("LocateAddrAndRank, srcRank: " << p2pInfo.first << ", destRank: " << p2pInfo.second);
+    return BM_OK;
+}
+
+Result MemEntityDefault::InitSegment()
+{
+    BM_LOG_DEBUG("Initialize segment with type: " << std::hex << options_.memType);
+    if (options_.memType & HYBM_MEM_TYPE_DEVICE) {
+        auto ret = InitHbmSegment();
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("InitHbmSegment() failed: " << ret);
+            return ret;
+        }
+    }
+
+    if (options_.memType & HYBM_MEM_TYPE_HOST) {
+        auto ret = InitDramSegment();
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("InitDramSegment() failed: " << ret);
+            return ret;
+        }
+    }
+
+    return BM_OK;
+}
+
+Result MemEntityDefault::InitHbmSegment()
+{
+    if (options_.maxHBMSize == 0) {
+        BM_LOG_INFO("Hbm rank space is zero.");
+        return BM_OK;
+    }
+
+    MemSegmentOptions segmentOptions;
+    if (options_.scene != HYBM_SCENE_TRANS) {
+        segmentOptions.size = options_.deviceVASpace;
+        segmentOptions.maxSize = options_.maxHBMSize;
+        segmentOptions.segType = HYBM_MST_HBM;
+        BM_LOG_TRACE("create entity global unified memory space.");
+    } else {
+        segmentOptions.size = options_.deviceVASpace;
+        segmentOptions.maxSize = options_.maxHBMSize;
+        segmentOptions.segType = HYBM_MST_ASYMMETRIC;
+        BM_LOG_TRACE("create entity user defined memory space.");
+    }
+    segmentOptions.devId = HybmGetInitDeviceId();
+    segmentOptions.rankId = options_.rankId;
+    segmentOptions.rankCnt = options_.rankCount;
+    segmentOptions.dataOpType = options_.bmDataOpType;
+    segmentOptions.flags = options_.flags;
+    segmentOptions.enable56BitsGva = options_.enable56BitsGva;
+    segmentOptions.scene = options_.scene;
+    constexpr auto transportMask = HYBM_DOP_TYPE_DEVICE_RDMA | HYBM_DOP_TYPE_DEVICE_URMA | HYBM_DOP_TYPE_HOST_RDMA;
+    if ((options_.bmDataOpType & transportMask) != 0U && (options_.bmDataOpType & HYBM_DOP_TYPE_SDMA) == 0U) {
+        segmentOptions.shared = false;
+    }
+
+    hbmSegment_ = MemSegment::Create(segmentOptions, id_);
+    if (hbmSegment_ == nullptr) {
+        BM_LOG_ERROR("Failed to create hbm segment");
+        return BM_ERROR;
+    }
+    return BM_OK;
+}
+
+Result MemEntityDefault::InitDramSegment()
+{
+    if (options_.maxDRAMSize == 0) {
+        BM_LOG_INFO("Dram rank space is zero.");
+        return BM_OK;
+    }
+
+    MemSegmentOptions segmentOptions;
+    segmentOptions.size = options_.hostVASpace;
+    segmentOptions.maxSize = options_.maxDRAMSize;
+    segmentOptions.devId = HybmGetInitDeviceId();
+    segmentOptions.segType = HYBM_MST_DRAM;
+    segmentOptions.rankId = options_.rankId;
+    segmentOptions.rankCnt = options_.rankCount;
+    segmentOptions.dataOpType = options_.bmDataOpType;
+    segmentOptions.flags = options_.flags;
+    segmentOptions.shmFd = options_.dramShmFd;
+    segmentOptions.enable56BitsGva = options_.enable56BitsGva;
+    segmentOptions.scene = options_.scene;
+    constexpr auto deviceTransportMask = HYBM_DOP_TYPE_DEVICE_RDMA | HYBM_DOP_TYPE_DEVICE_URMA;
+    if ((options_.bmDataOpType & deviceTransportMask) != 0U && (options_.bmDataOpType & HYBM_DOP_TYPE_SDMA) == 0U) {
+        segmentOptions.shared = false;
+    }
+    dramSegment_ = MemSegment::Create(segmentOptions, id_);
+    if (dramSegment_ == nullptr) {
+        BM_LOG_ERROR("Failed to create dram segment");
+        return BM_ERROR;
+    }
+    if (options_.scene != HYBM_SCENE_TRANS && (options_.bmDataOpType & HYBM_DOP_TYPE_SDMA) != 0U &&
+        (options_.bmDataOpType & deviceTransportMask) == 0U && !dramSegment_->CheckSdmaReaches(options_.rankId)) {
+        BM_LOG_ERROR("dram segment does not support sdma in current environment, rankId: " << options_.rankId);
+        return BM_ERROR;
+    }
+    return BM_OK;
+}
+
+Result MemEntityDefault::InitTransManager()
+{
+    if (options_.bmDataOpType == HYBM_DOP_TYPE_HOST_SHM) {
+        BM_LOG_DEBUG("HOST_SHM data operator selected, skip transport manager initialization.");
+        return BM_OK;
+    }
+
+    if (options_.rankCount <= 1) {
+        BM_LOG_INFO("rank total count : " << options_.rankCount << ", no transport.");
+        return BM_OK;
+    }
+
+    auto hostTransFlags = HYBM_DOP_TYPE_HOST_RDMA | HYBM_DOP_TYPE_HOST_URMA | HYBM_DOP_TYPE_HOST_TCP;
+    auto composeTransFlags =
+        HYBM_DOP_TYPE_DEVICE_RDMA | HYBM_DOP_TYPE_AIV_SDMA | HYBM_DOP_TYPE_DEVICE_URMA | hostTransFlags;
+    if ((options_.bmDataOpType & composeTransFlags) == 0) {
+        BM_LOG_DEBUG("NO RDMA/URMA Data Operator transport skip init.");
+        return BM_OK;
+    }
+    if (options_.bmDataOpType & HYBM_DOP_TYPE_AIV_SDMA) {
+        transportManager_ = transport::TransportManager::Create(transport::TT_SDMA, tagManager_);
+    } else {
+        transportManager_ = transport::TransportManager::Create(transport::TT_COMPOSE, tagManager_);
+    }
+    BM_ASSERT_LOG_AND_RETURN(transportManager_ != nullptr, "Failed to create transportManager.", BM_ERROR);
+
+    transport::TransportOptions options{};
+    options.rankId = options_.rankId;
+    options.rankCount = options_.rankCount;
+    options.protocol = options_.bmDataOpType;
+    options.role = options_.role;
+    options.scene = options_.scene;
+    options.initialType = options_.bmType;
+    options.nic = options_.transUrl;
+    options.tlsOption = options_.tlsOption;
+    auto ret = transportManager_->OpenDevice(options);
+    if (ret != 0) {
+        BM_LOG_ERROR("Failed to open device, ret: " << ret << " rankId: " << options_.rankId << " protocol: "
+                                                    << options_.bmDataOpType << " nic: " << options.nic);
+        transportManager_ = nullptr;
+    }
+    return ret;
+}
+
+Result MemEntityDefault::InitDataOperator()
+{
+    // AI_CORE驱动不走这里的dateOperator
+    if (options_.bmType == HYBM_TYPE_AI_CORE_INITIATE) {
+        BM_LOG_INFO("Type is ai core, not need init data operator.");
+        return BM_OK;
+    }
+
+    // use composeDataOperator
+    dataOperator_ = std::make_shared<HostComposeDataOp>(options_, transportManager_, tagManager_);
+    auto ret = dataOperator_->Initialize();
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("Failed to init data operator ret:" << ret);
+        return ret;
+    }
+    // imported gva 的连接域解析：多进程实体同址共存（多 store 组窗口号撞车）时，
+    // 全局台账的同 gva 行无法区分连接，注入本实体导入记录的解析器供数据面优先使用
+    dataOperator_->SetImportedGvaResolver([this](uint64_t gva) -> uint64_t {
+        uint64_t lva = 0;
+        if (hbmSegment_ != nullptr && hbmSegment_->ResolveRemoteGva(gva, lva)) {
+            return lva;
+        }
+        if (dramSegment_ != nullptr && dramSegment_->ResolveRemoteGva(gva, lva)) {
+            return lva;
+        }
+        return 0;
+    });
+    return BM_OK;
+}
+
+bool MemEntityDefault::SdmaReaches(uint32_t remoteRank) const noexcept
+{
+    if (hbmSegment_ != nullptr) {
+        return hbmSegment_->CheckSdmaReaches(remoteRank);
+    }
+
+    if (dramSegment_ != nullptr) {
+        return dramSegment_->CheckSdmaReaches(remoteRank);
+    }
+
+    return false;
+}
+
+hybm_data_op_type MemEntityDefault::CanReachDataOperators(uint32_t remoteRank) const noexcept
+{
+    uint32_t supportDataOp = 0U;
+    if ((options_.bmDataOpType & HYBM_DOP_TYPE_SDMA) && SdmaReaches(remoteRank)) {
+        supportDataOp |= (HYBM_DOP_TYPE_MTE | HYBM_DOP_TYPE_SDMA);
+    }
+
+    if (options_.bmDataOpType & HYBM_DOP_TYPE_DEVICE_RDMA) {
+        supportDataOp |= HYBM_DOP_TYPE_DEVICE_RDMA;
+    }
+
+    if (options_.bmDataOpType & HYBM_DOP_TYPE_DEVICE_URMA) {
+        supportDataOp |= HYBM_DOP_TYPE_DEVICE_URMA;
+    }
+
+    if (options_.bmDataOpType & HYBM_DOP_TYPE_HOST_RDMA) {
+        supportDataOp |= HYBM_DOP_TYPE_HOST_RDMA;
+    }
+
+    if (options_.bmDataOpType & HYBM_DOP_TYPE_HOST_SHM) {
+        supportDataOp |= HYBM_DOP_TYPE_HOST_SHM;
+    }
+
+    if (options_.bmDataOpType & HYBM_DOP_TYPE_HOST_URMA) {
+        supportDataOp |= HYBM_DOP_TYPE_HOST_URMA;
+    }
+    return static_cast<hybm_data_op_type>(supportDataOp);
+}
+
+void *MemEntityDefault::GetReservedMemoryPtr(hybm_mem_type memType) noexcept
+{
+    if (memType == HYBM_MEM_TYPE_DEVICE) {
+        return hbmGva_;
+    }
+
+    if (memType == HYBM_MEM_TYPE_HOST) {
+        return dramGva_;
+    }
+
+    return nullptr;
+}
+
+int32_t MemEntityDefault::SetThreadAclDevice()
+{
+#if !defined(ASCEND_NPU)
+    return BM_OK;
+#endif
+    // Other runtimes can change this thread's ACL device between transfers.
+    // Recheck the current device before reusing any device-bound resources.
+    const auto deviceId = HybmGetInitDeviceId();
+    const auto ret = DlAclApi::AclrtSetDevice(deviceId);
+    BM_ASSERT_LOG_AND_RETURN(ret == BM_OK, "aclrtSetDevice failed, deviceId: " << deviceId << " ret: " << ret, ret);
+    return BM_OK;
+}
+
+void MemEntityDefault::ReleaseResources()
+{
+    if (!initialized_) {
+        return;
+    }
+    dataOperator_.reset();
+    if (transportManager_ != nullptr) {
+        transportManager_->CloseDevice();
+    }
+    // Imported mappings are tracked separately from local slices and can survive
+    // UnReserveMemorySpace(). Clear them before dropping segment objects so the
+    // same process can initialize again without stale VA records.
+    Unmap();
+    UnReserveMemorySpace();
+    importedRanks_.clear();
+    importedMemories_.clear();
+    hbmGva_ = nullptr;
+    dramGva_ = nullptr;
+    hbmSegment_.reset();
+    dramSegment_.reset();
+    if (transportManager_ != nullptr) {
+        transportManager_.reset();
+    }
+    tagManager_.reset();
+    transportPrepared_ = false;
+    initialized_ = false;
+    decltype(managedAllocations_) allocations;
+    {
+        std::lock_guard<std::mutex> lock(managedAllocationsMutex_);
+        allocations.swap(managedAllocations_);
+    }
+}
+} // namespace mf
+} // namespace ock

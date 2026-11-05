@@ -1,0 +1,69 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+ * MemFabric_Hybrid is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ *          http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+ * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+*/
+#include "hybm_transport_manager.h"
+
+#include "mf_env_define.h"
+#include "hybm_logger.h"
+#include "host_hcom_transport_manager.h"
+#include "device_rdma_transport_manager.h"
+#include "aiv_sdma_transport_manager.h"
+#include "compose_transport_manager.h"
+
+using namespace ock::mf;
+using namespace ock::mf::transport;
+
+std::shared_ptr<TransportManager> TransportManager::Create(TransportType type, HybmEntityTagInfoPtr tagManager)
+{
+    if (tagManager == nullptr) {
+        BM_LOG_ERROR("Failed to create transport manager, tag manager is nullptr");
+        return nullptr;
+    }
+    switch (type) {
+        case TT_HCOM:
+            // per-instance: see the comment on ComposeTransportManager::OpenHostTransport
+            return std::make_shared<host::HcomTransportManager>();
+        case TT_HCCP:
+            return std::make_shared<device::RdmaTransportManager>();
+        case TT_SDMA:
+            return std::make_shared<device::SdmaTransportManager>();
+        case TT_COMPOSE:
+            return std::make_shared<ComposeTransportManager>(tagManager);
+        default:
+            BM_LOG_ERROR("Invalid trans type: " << type);
+            return nullptr;
+    }
+}
+
+uint64_t TransportManager::GetSdmaWorkSpaceAddr() const
+{
+    BM_LOG_DEBUG("Not Implement GetSdmaWorkSpaceAddr()");
+    return 0UL;
+}
+
+const void *TransportManager::GetQpInfo() const
+{
+    BM_LOG_DEBUG("Not Implement GetQpInfo()");
+    return nullptr;
+}
+Result TransportManager::TransferRemoteBatchAsync(const hybm_batch_copy_params &params,
+                                                  hybm_data_copy_direction direction, const RankGroupMap &groupMap,
+                                                  std::vector<uint32_t> &localIndices, RankGroupMap &unregisteredGroups,
+                                                  std::set<uint32_t> &batchRanks)
+{
+    (void)direction;
+    (void)localIndices;
+    (void)unregisteredGroups;
+    batchRanks.clear();
+    BM_LOG_ERROR("TransferRemoteBatchAsync raw batch is not supported by this transport, batchSize: "
+                 << params.batchSize << " rankNum: " << groupMap.size());
+    return BM_NOT_SUPPORTED;
+}

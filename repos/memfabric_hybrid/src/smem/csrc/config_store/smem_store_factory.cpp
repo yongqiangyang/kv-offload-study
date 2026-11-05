@@ -1,0 +1,354 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+ * MemFabric_Hybrid is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ *          http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+ * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+*/
+
+#include <algorithm>
+#include <cctype>
+#include "smem_config_store_logger.h"
+#include "smem_tcp_config_store.h"
+#include "smem_prefix_config_store.h"
+#include "smem_local_memory_backend.h"
+#include "network_endpoint_util.h"
+#include "smem_etcd_store_backend.h"
+#include "smem_external_backend.h"
+#include "smem_ha_config_store.h"
+#include "smem_store_factory.h"
+
+namespace ock {
+namespace smem {
+static __thread int failedReason_ = 0;
+
+std::mutex StoreFactory::storesMutex_;
+std::unordered_map<std::string, StorePtr> StoreFactory::storesMap_;
+smem_tls_config StoreFactory::tlsOption_{};
+
+namespace {
+
+std::unordered_map<std::string, StorePtr> g_forkLeakSink;
+
+constexpr char URL_FRAGMENT_DELIMITER = '#';
+constexpr char CLUSTER_ID_HYPHEN = '-';
+constexpr char CLUSTER_ID_UNDERSCORE = '_';
+
+struct ParsedStoreUrl {
+    std::string backendUrl;
+    std::string instanceId;
+};
+
+[[nodiscard]] bool IsValidClusterIdCharacter(char ch) noexcept
+{
+    const unsigned char clusterChar = static_cast<unsigned char>(ch);
+    return std::isalnum(clusterChar) != 0 || ch == CLUSTER_ID_HYPHEN || ch == CLUSTER_ID_UNDERSCORE;
+}
+
+[[nodiscard]] bool ParseStoreUrl(const std::string &storeUrl, ParsedStoreUrl &parsedStoreUrl) noexcept
+{
+    // Keep CreateStoreByUrl stable by carrying optional distributed cluster isolation in the URL fragment.
+    parsedStoreUrl.backendUrl = storeUrl;
+    parsedStoreUrl.instanceId.clear();
+
+    const size_t fragmentPos = storeUrl.find(URL_FRAGMENT_DELIMITER);
+    if (fragmentPos == std::string::npos) {
+        return true;
+    }
+
+    if (storeUrl.find(URL_FRAGMENT_DELIMITER, fragmentPos + 1) != std::string::npos) {
+        STORE_LOG_ERROR("Invalid store url: multiple cluster fragments, storeUrl: " << storeUrl);
+        return false;
+    }
+
+    if (!NetworkEndpointUtil::SupportsClusterFragment(storeUrl)) {
+        STORE_LOG_ERROR("Invalid store url: cluster fragment is only supported for etcd/reg, storeUrl: " << storeUrl);
+        return false;
+    }
+
+    if (fragmentPos == storeUrl.size() - 1) {
+        STORE_LOG_ERROR("Invalid store url: cluster id is empty, storeUrl: " << storeUrl);
+        return false;
+    }
+
+    parsedStoreUrl.backendUrl = storeUrl.substr(0, fragmentPos);
+    parsedStoreUrl.instanceId = storeUrl.substr(fragmentPos + 1);
+    const bool clusterIdValid =
+        std::all_of(parsedStoreUrl.instanceId.begin(), parsedStoreUrl.instanceId.end(), IsValidClusterIdCharacter);
+    if (!clusterIdValid) {
+        STORE_LOG_ERROR("Invalid store url: cluster id contains unsupported characters, storeUrl: " << storeUrl);
+        return false;
+    }
+
+    return true;
+}
+
+} // namespace
+
+[[nodiscard]] static StoreBackendPtr CreateBackend(BackendType type, const std::string &backendUrl,
+                                                   const std::string &userName, const std::string &password,
+                                                   const std::string &instanceId)
+{
+    StoreBackendPtr result = nullptr;
+
+    switch (type) {
+        case BackendType::TCP: {
+            auto backend = SmMakeRef<SmemLocalMemoryBackend>();
+            result = Convert<SmemLocalMemoryBackend, ConfigStoreBackend>(backend);
+            break;
+        }
+        case BackendType::ETCD: {
+            auto backend = SmMakeRef<SmemEtcdStoreBackend>(instanceId);
+            result = Convert<SmemEtcdStoreBackend, ConfigStoreBackend>(backend);
+            break;
+        }
+        case BackendType::REG: {
+            auto backend = SmMakeRef<SmemExternalBackend>(instanceId);
+            result = Convert<SmemExternalBackend, ConfigStoreBackend>(backend);
+            break;
+        }
+        default:
+            STORE_LOG_ERROR("CreateBackend unknown backend type: " << static_cast<int>(type));
+            return nullptr;
+    }
+    if (result == nullptr) {
+        return nullptr;
+    }
+
+    if (result->Initialize(backendUrl, userName, password) != SUCCESS) {
+        STORE_LOG_ERROR("Backend init failed, url: " << backendUrl);
+        return nullptr;
+    }
+
+    return result;
+}
+
+static std::string BuildTcpUrl(const std::string &ip, uint16_t port)
+{
+    return NetworkEndpointUtil::BuildEndpoint("tcp", ip, port);
+}
+
+// --- CreateStoreByUrl (ip, port) overload: TCP only ---
+StorePtr StoreFactory::CreateStore(const std::string &ip, uint16_t port, uint16_t model, uint32_t worldSize,
+                                   int32_t rankId, int32_t connMaxRetry) noexcept
+{
+    std::string storeUrl = BuildTcpUrl(ip, port);
+    STORE_ASSERT_RETURN(!storeUrl.empty(), nullptr);
+    STORE_VALIDATE_RETURN(worldSize <= SMEM_WORLD_SIZE_MAX || worldSize == UINT32_MAX,
+                          "world size " << worldSize << " too large", nullptr);
+    std::string storeKey = storeUrl;
+
+    std::unique_lock<std::mutex> lockGuard{storesMutex_};
+    auto pos = storesMap_.find(storeKey);
+    if (pos != storesMap_.end()) {
+        return pos->second;
+    }
+    auto backend = CreateBackend(BackendType::TCP, storeUrl, "", "", "");
+    STORE_ASSERT_RETURN(backend != nullptr, nullptr);
+
+    auto store = SmMakeRef<TcpConfigStore>(backend, ip, port, model, true, worldSize, rankId);
+    STORE_ASSERT_RETURN(store != nullptr, nullptr);
+
+    auto ret = store->Startup(tlsOption_, connMaxRetry);
+    if (ret == SM_RESOURCE_IN_USE) {
+        STORE_LOG_TRACE("Startup for store(url=" << ip << ":" << port << ", model=" << model << ", rank=" << rankId
+                                                 << ") address in use");
+        failedReason_ = SM_RESOURCE_IN_USE;
+        return nullptr;
+    }
+    if (ret != 0) {
+        STORE_LOG_ERROR("Startup for store(url=" << ip << ":" << port << ", model=" << model << ", rank=" << rankId
+                                                 << ") failed:" << ret);
+        failedReason_ = ret;
+        return nullptr;
+    }
+
+    storesMap_.emplace(storeKey, store.Get());
+    lockGuard.unlock();
+
+    return store.Get();
+}
+
+// --- CreateStoreByUrl (storeUrl) overload: TCP / ETCD / etc. ---
+StorePtr StoreFactory::CreateStoreByUrl(const std::string &storeUrl, uint16_t model, uint32_t worldSize, int32_t rankId,
+                                        int32_t connMaxRetry, bool skipRecover) noexcept
+{
+    ParsedStoreUrl parsedStoreUrl;
+    STORE_VALIDATE_RETURN(worldSize <= SMEM_WORLD_SIZE_MAX || worldSize == UINT32_MAX,
+                          "world size " << worldSize << " too large", nullptr);
+    if (!ParseStoreUrl(storeUrl, parsedStoreUrl)) {
+        failedReason_ = SM_INVALID_PARAM;
+        return nullptr;
+    }
+
+    const std::string &storeKey = storeUrl;
+    uint16_t port;
+    std::string ip;
+    BackendType type;
+    STORE_ASSERT_RETURN(NetworkEndpointUtil::ExtractIpAndPort(parsedStoreUrl.backendUrl, ip, port, type), nullptr);
+
+    std::unique_lock<std::mutex> lockGuard{storesMutex_};
+    auto pos = storesMap_.find(storeKey);
+    if (pos != storesMap_.end()) {
+        return pos->second;
+    }
+    auto backend = CreateBackend(type, parsedStoreUrl.backendUrl, "", "", parsedStoreUrl.instanceId);
+    if (backend == nullptr) {
+        failedReason_ = SM_ERROR;
+        return nullptr;
+    }
+    if (type == BackendType::REG && !backend->IsDistributed()) {
+        STORE_LOG_ERROR("External backend must be distributed, url: " << parsedStoreUrl.backendUrl);
+        failedReason_ = SM_ERROR;
+        return nullptr;
+    }
+    if (backend->IsDistributed()) {
+        HaStoreOptions opts;
+        opts.backend = backend;
+        opts.storeKey = storeKey;
+        opts.storeUrl = parsedStoreUrl.backendUrl;
+        opts.worldSize = worldSize;
+        opts.instanceId = parsedStoreUrl.instanceId;
+        opts.rankId = rankId;
+        opts.model = model;
+        return CreateHaStore(opts);
+    }
+    TcpStoreOptions opts;
+    opts.backend = backend;
+    opts.ip = ip;
+    opts.port = port;
+    opts.model = model;
+    opts.worldSize = worldSize;
+    opts.rankId = rankId;
+    opts.storeKey = storeKey;
+    opts.connMaxRetry = connMaxRetry;
+    opts.skipRecover = skipRecover;
+    return CreateTcpStore(opts);
+}
+
+StorePtr StoreFactory::CreateTcpStore(const TcpStoreOptions &opts) noexcept
+{
+    auto store = SmMakeRef<TcpConfigStore>(opts.backend, opts.ip, opts.port, opts.model, opts.skipRecover,
+                                           opts.worldSize, opts.rankId);
+    STORE_ASSERT_RETURN(store != nullptr, nullptr);
+
+    auto ret = store->Startup(tlsOption_, opts.connMaxRetry);
+    if (ret == SM_RESOURCE_IN_USE) {
+        STORE_LOG_TRACE("Startup for store(url=" << opts.ip << ":" << opts.port << ", model=" << opts.model
+                                                 << ", rank=" << opts.rankId << ") address in use");
+        failedReason_ = SM_RESOURCE_IN_USE;
+        return nullptr;
+    }
+    if (ret != 0) {
+        STORE_LOG_ERROR("Startup for store(url=" << opts.ip << ":" << opts.port << ", model=" << opts.model
+                                                 << ", rank=" << opts.rankId << ") failed:" << ret);
+        failedReason_ = ret;
+        return nullptr;
+    }
+
+    storesMap_.emplace(opts.storeKey, store.Get());
+    return store.Get();
+}
+
+StorePtr StoreFactory::CreateHaStore(const HaStoreOptions &opts) noexcept
+{
+    STORE_ASSERT_RETURN(opts.backend != nullptr, nullptr);
+    // Pass rankId so the delegate's localRankId_ is correct from the start; the
+    // delegate establishes its TCP link to the leader during Startup() below,
+    // before the caller has a chance to call SetRankId. A wrong localRankId_ at
+    // link time makes the server's link->rank map carry UINT32_MAX, so later
+    // PROMOTE_TO_ACTIVE/whitelist control messages can't be routed ("no link
+    // for rankId") and join never completes in etcd mode.
+    auto clientDelegate = SmMakeRef<TcpConfigStore>(opts.backend, "", 0, false, true, opts.worldSize, opts.rankId);
+    STORE_ASSERT_RETURN(clientDelegate != nullptr, nullptr);
+    const auto store =
+        SmMakeRef<HaConfigStore>(opts.backend, clientDelegate, opts.storeUrl, opts.worldSize, opts.model);
+    STORE_ASSERT_RETURN(store != nullptr, nullptr);
+
+    const auto ret = store->Startup(tlsOption_);
+    if (ret != SM_OK) {
+        STORE_LOG_ERROR("Startup for ha store failed:" << ret);
+        failedReason_ = ret;
+        return nullptr;
+    }
+
+    storesMap_.emplace(opts.storeKey, store.Get());
+    return store.Get();
+}
+
+// --- DestroyStore (ip, port) overload ---
+void StoreFactory::DestroyStore(const std::string &ip, uint16_t port) noexcept
+{
+    std::string storeKey = BuildTcpUrl(ip, port);
+    std::unique_lock<std::mutex> lockGuard{storesMutex_};
+    storesMap_.erase(storeKey);
+}
+
+// --- DestroyStore (storeUrl) overload ---
+void StoreFactory::DestroyStore(const std::string &storeUrl) noexcept
+{
+    std::unique_lock<std::mutex> lockGuard{storesMutex_};
+    storesMap_.erase(storeUrl);
+}
+
+std::vector<StorePtr> StoreFactory::SnapshotStores() noexcept
+{
+    std::lock_guard<std::mutex> guard{storesMutex_};
+    std::vector<StorePtr> snapshot;
+    snapshot.reserve(storesMap_.size());
+    for (const auto &item : storesMap_) {
+        snapshot.push_back(item.second);
+    }
+    return snapshot;
+}
+
+void StoreFactory::DestroyStoreAll(bool afterFork) noexcept
+{
+    if (afterFork) {
+        g_forkLeakSink.swap(storesMap_);
+        return;
+    }
+    std::unordered_map<std::string, StorePtr> localStores;
+    {
+        std::unique_lock<std::mutex> lockGuard{storesMutex_};
+        localStores.swap(storesMap_);
+    }
+    for (auto &e : localStores) {
+        SmRef<TcpConfigStore> tcp = Convert<ConfigStore, TcpConfigStore>(e.second);
+        if (tcp != nullptr) {
+            tcp->Shutdown(false);
+            continue;
+        }
+        auto ha = Convert<ConfigStore, HaConfigStore>(e.second);
+        if (ha != nullptr) {
+            ha.Set(nullptr);
+        }
+    }
+}
+
+StorePtr StoreFactory::PrefixStore(const ock::smem::StorePtr &base, const std::string &prefix) noexcept
+{
+    STORE_VALIDATE_RETURN(base != nullptr, "invalid param, base is nullptr", nullptr);
+
+    auto store = SmMakeRef<PrefixConfigStore>(base, prefix);
+    STORE_ASSERT_RETURN(store != nullptr, nullptr);
+
+    return store.Get();
+}
+
+int StoreFactory::GetFailedReason() noexcept
+{
+    return failedReason_;
+}
+
+void StoreFactory::SetTlsInfo(const smem_tls_config &tlsOption) noexcept
+{
+    tlsOption_ = tlsOption;
+}
+
+} // namespace smem
+} // namespace ock

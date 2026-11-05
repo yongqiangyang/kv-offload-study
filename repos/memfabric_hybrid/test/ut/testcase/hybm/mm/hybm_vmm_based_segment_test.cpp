@@ -1,0 +1,418 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+ * MemFabric_Hybrid is licensed under Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ *          http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+ * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+ */
+
+#include <gtest/gtest.h>
+#include <mockcpp/mockcpp.hpp>
+
+#define private   public
+#define protected public
+#include "hybm_vmm_based_segment.h"
+#undef private
+#undef protected
+
+#include "hybm_va_manager.h"
+
+#define MOCKER_CPP(api, TT) MOCKCPP_NS::mockAPI(#api, reinterpret_cast<TT>(api))
+
+using namespace ock::mf;
+
+namespace {
+int HalMemImportOk(drv_mem_handle_type, MemShareHandle *, uint32_t, drv_mem_handle_t **handle)
+{
+    *handle = reinterpret_cast<drv_mem_handle_t *>(0x1234);
+    return BM_OK;
+}
+
+int HalMemMapOk(void *, size_t, size_t, drv_mem_handle_t *, uint64_t)
+{
+    return BM_OK;
+}
+
+int HalMemMapFail(void *, size_t, size_t, drv_mem_handle_t *, uint64_t)
+{
+    return BM_ERROR;
+}
+
+int gHalMemMapCalls = 0;
+int HalMemMapSuccessAfterFirstFailure(void *, size_t, size_t, drv_mem_handle_t *, uint64_t)
+{
+    return (gHalMemMapCalls++ == 0) ? BM_ERROR : BM_OK;
+}
+
+int HalMemReleaseOk(drv_mem_handle_t *)
+{
+    return BM_OK;
+}
+
+int HalMemUnmapOk(void *)
+{
+    return BM_OK;
+}
+} // namespace
+
+class HybmVmmBasedSegmentTest : public testing::Test {
+protected:
+    void SetUp() override
+    {
+        GlobalMockObject::reset();
+        HybmVaManager::GetInstance().ClearAll();
+    }
+
+    void TearDown() override
+    {
+        GlobalMockObject::verify();
+        GlobalMockObject::reset();
+        HybmVaManager::GetInstance().ClearAll();
+    }
+};
+
+/**
+* Mmap_RemoteSlice_SucceedsAndSkipsLocal
+*  - 远端可达时完成映射；本 rank 记录跳过。
+*/
+TEST_F(HybmVmmBasedSegmentTest, Mmap_RemoteSlice_SucceedsAndSkipsLocal)
+{
+    MemSegmentOptions opt{};
+    opt.segType = HYBM_MST_DRAM;
+    opt.maxSize = HYBM_LARGE_PAGE_SIZE;
+    opt.rankCnt = 2UL;
+    opt.rankId = 0;
+    opt.shared = true;
+
+    HybmVmmBasedSegment seg(opt, 0);
+    HybmVaManager::GetInstance().AllocReserveGva(
+        {opt.maxSize * opt.rankCnt, opt.maxSize * opt.rankCnt, HYBM_MEM_TYPE_HOST});
+
+    HostSdmaExportInfo local{};
+    local.gva = 0x1000;
+    local.rankId = 0;
+    local.size = HYBM_LARGE_PAGE_SIZE;
+    local.segmentType = SEGMENT_TYPE_VMM;
+
+    HostSdmaExportInfo remote{};
+    remote.gva = opt.maxSize;
+    remote.deviceVa = opt.maxSize;
+    remote.rankId = 1;
+    remote.size = HYBM_LARGE_PAGE_SIZE;
+    remote.segmentType = SEGMENT_TYPE_VMM;
+    remote.magic = DRAM_SLICE_EXPORT_INFO_MAGIC;
+    remote.superPodId = 1;
+    remote.serverId = 1;
+
+    seg.imports_ = {local, remote};
+
+    MOCKER_CPP(&MemSegment::CanSdmaReaches, bool (*)(MemSegment *, uint32_t, uint32_t, uint32_t))
+        .stubs()
+        .will(returnValue(true));
+    MOCKER_CPP(&DlHalApi::HalMemImport, int (*)(drv_mem_handle_type, MemShareHandle *, uint32_t, drv_mem_handle_t **))
+        .stubs()
+        .will(invoke(HalMemImportOk));
+    MOCKER_CPP(&DlHalApi::HalMemMap, int (*)(void *, size_t, size_t, drv_mem_handle_t *, uint64_t))
+        .stubs()
+        .will(invoke(HalMemMapOk));
+    MOCKER_CPP(&DlHalApi::HalMemRelease, int (*)(drv_mem_handle_t *)).stubs().will(invoke(HalMemReleaseOk));
+    MOCKER_CPP(&DlHalApi::HalMemUnmap, int (*)(void *)).stubs().will(invoke(HalMemUnmapOk));
+
+    auto ret = seg.Mmap();
+    EXPECT_EQ(ret, BM_OK);
+    EXPECT_TRUE(seg.imports_.empty());
+    EXPECT_EQ(seg.mappedGvaMem_.size(), 1U);
+    EXPECT_TRUE(seg.mappedGvaMem_.count(remote.gva) == 1U);
+    EXPECT_EQ(HybmVaManager::GetInstance().GetAllocCount(), 1U);
+    EXPECT_TRUE(seg.CheckSdmaReaches(remote.rankId));
+}
+
+/**
+* Mmap_MapFailure_RollsBackVaInfo
+*  - 后续 HalMemMap 失败时，已登记的外部 VA 应回滚。
+*/
+TEST_F(HybmVmmBasedSegmentTest, Mmap_MapFailure_RollsBackVaInfo)
+{
+    MemSegmentOptions opt{};
+    opt.segType = HYBM_MST_DRAM;
+    opt.maxSize = HYBM_LARGE_PAGE_SIZE;
+    opt.rankCnt = 2UL;
+    opt.rankId = 0;
+    opt.shared = true;
+
+    HybmVmmBasedSegment seg(opt, 0);
+    HybmVaManager::GetInstance().AllocReserveGva(
+        {opt.maxSize * opt.rankCnt, opt.maxSize * opt.rankCnt, HYBM_MEM_TYPE_HOST});
+
+    HostSdmaExportInfo remote{};
+    remote.gva = opt.maxSize;
+    remote.deviceVa = opt.maxSize;
+    remote.rankId = 1;
+    remote.size = HYBM_LARGE_PAGE_SIZE;
+    remote.segmentType = SEGMENT_TYPE_VMM;
+    remote.magic = DRAM_SLICE_EXPORT_INFO_MAGIC;
+    remote.superPodId = 1;
+    remote.serverId = 1;
+
+    seg.imports_.push_back(remote);
+
+    MOCKER_CPP(&MemSegment::CanSdmaReaches, bool (*)(MemSegment *, uint32_t, uint32_t, uint32_t))
+        .stubs()
+        .will(returnValue(true));
+    MOCKER_CPP(&DlHalApi::HalMemImport, int (*)(drv_mem_handle_type, MemShareHandle *, uint32_t, drv_mem_handle_t **))
+        .stubs()
+        .will(invoke(HalMemImportOk));
+    MOCKER_CPP(&DlHalApi::HalMemMap, int (*)(void *, size_t, size_t, drv_mem_handle_t *, uint64_t))
+        .stubs()
+        .will(invoke(HalMemMapFail));
+    MOCKER_CPP(&DlHalApi::HalMemRelease, int (*)(drv_mem_handle_t *)).stubs().will(invoke(HalMemReleaseOk));
+
+    auto ret = seg.Mmap();
+    EXPECT_EQ(ret, BM_ERROR);
+    EXPECT_TRUE(seg.mappedGvaMem_.empty());
+    EXPECT_EQ(HybmVaManager::GetInstance().GetAllocCount(), 0U);
+}
+
+/**
+* Mmap_Failure_KeepsPendingImportsForRetry
+*  - 映射失败时不得清空 imports_，否则上层重试 hybm_mmap() 时无数据可映射，对端 slice 永久丢失。
+*/
+TEST_F(HybmVmmBasedSegmentTest, Mmap_Failure_KeepsPendingImportsForRetry)
+{
+    MemSegmentOptions opt{};
+    opt.segType = HYBM_MST_DRAM;
+    opt.maxSize = HYBM_LARGE_PAGE_SIZE;
+    opt.rankCnt = 2UL;
+    opt.rankId = 0;
+    opt.shared = true;
+
+    HybmVmmBasedSegment seg(opt, 0);
+    HybmVaManager::GetInstance().AllocReserveGva(
+        {opt.maxSize * opt.rankCnt, opt.maxSize * opt.rankCnt, HYBM_MEM_TYPE_HOST});
+
+    HostSdmaExportInfo remote{};
+    remote.gva = opt.maxSize;
+    remote.deviceVa = opt.maxSize;
+    remote.rankId = 1;
+    remote.size = HYBM_LARGE_PAGE_SIZE;
+    remote.segmentType = SEGMENT_TYPE_VMM;
+    remote.magic = DRAM_SLICE_EXPORT_INFO_MAGIC;
+    remote.superPodId = 1;
+    remote.serverId = 1;
+
+    seg.imports_.push_back(remote);
+    gHalMemMapCalls = 0;
+
+    MOCKER_CPP(&MemSegment::CanSdmaReaches, bool (*)(MemSegment *, uint32_t, uint32_t, uint32_t))
+        .stubs()
+        .will(returnValue(true));
+    MOCKER_CPP(&DlHalApi::HalMemImport, int (*)(drv_mem_handle_type, MemShareHandle *, uint32_t, drv_mem_handle_t **))
+        .stubs()
+        .will(invoke(HalMemImportOk));
+    MOCKER_CPP(&DlHalApi::HalMemMap, int (*)(void *, size_t, size_t, drv_mem_handle_t *, uint64_t))
+        .stubs()
+        .will(invoke(HalMemMapSuccessAfterFirstFailure));
+    MOCKER_CPP(&DlHalApi::HalMemRelease, int (*)(drv_mem_handle_t *)).stubs().will(invoke(HalMemReleaseOk));
+    MOCKER_CPP(&DlHalApi::HalMemUnmap, int (*)(void *)).stubs().will(invoke(HalMemUnmapOk));
+
+    // 首次映射失败：待映射项必须保留，供上层重试
+    auto ret = seg.Mmap();
+    EXPECT_EQ(ret, BM_ERROR);
+    EXPECT_EQ(seg.imports_.size(), 1U);
+    EXPECT_TRUE(seg.mappedGvaMem_.empty());
+
+    // 重试成功：从断点继续补齐
+    ret = seg.Mmap();
+    EXPECT_EQ(ret, BM_OK);
+    EXPECT_TRUE(seg.imports_.empty());
+    EXPECT_EQ(seg.mappedGvaMem_.size(), 1U);
+    EXPECT_EQ(HybmVaManager::GetInstance().GetAllocCount(), 1U);
+}
+
+/**
+* Mmap_A2_HBM_CrossMachine
+*  - A2跨机 Device_rdma访问HBM内存，VaManager中只记录gva和rank_id，hva和dva值0
+*/
+TEST_F(HybmVmmBasedSegmentTest, Mmap_A2_HBM_CrossMachine)
+{
+    MemSegmentOptions opt{};
+    opt.segType = HYBM_MST_HBM;
+    opt.maxSize = HYBM_LARGE_PAGE_SIZE;
+    opt.rankCnt = 2UL;
+    opt.rankId = 0;
+    opt.shared = true;
+
+    HybmVmmBasedSegment seg(opt, 0);
+    HybmVaManager::GetInstance().AllocReserveGva(
+        {opt.maxSize * opt.rankCnt, opt.maxSize * opt.rankCnt, HYBM_MEM_TYPE_DEVICE});
+
+    HostSdmaExportInfo local{};
+    local.gva = 0x1000;
+    local.rankId = 0;
+    local.size = HYBM_LARGE_PAGE_SIZE;
+    local.segmentType = SEGMENT_TYPE_VMM;
+
+    HostSdmaExportInfo remote{};
+    remote.gva = opt.maxSize;
+    remote.deviceVa = opt.maxSize;
+    remote.rankId = 1;
+    remote.size = HYBM_LARGE_PAGE_SIZE;
+    remote.segmentType = SEGMENT_TYPE_VMM;
+    remote.magic = DRAM_SLICE_EXPORT_INFO_MAGIC;
+    remote.superPodId = 1;
+    remote.serverId = 1;
+
+    seg.imports_ = {local, remote};
+
+    MOCKER_CPP(&MemSegment::CanSdmaReaches, bool (*)(MemSegment *, uint32_t, uint32_t, uint32_t))
+        .stubs()
+        .will(returnValue(false));
+    MOCKER_CPP(&DlHalApi::HalMemImport, int (*)(drv_mem_handle_type, MemShareHandle *, uint32_t, drv_mem_handle_t **))
+        .stubs()
+        .will(invoke(HalMemImportOk));
+    MOCKER_CPP(&DlHalApi::HalMemMap, int (*)(void *, size_t, size_t, drv_mem_handle_t *, uint64_t))
+        .stubs()
+        .will(invoke(HalMemMapOk));
+    MOCKER_CPP(&DlHalApi::HalMemRelease, int (*)(drv_mem_handle_t *)).stubs().will(invoke(HalMemReleaseOk));
+    MOCKER_CPP(&DlHalApi::HalMemUnmap, int (*)(void *)).stubs().will(invoke(HalMemUnmapOk));
+
+    auto ret = seg.Mmap();
+    EXPECT_EQ(ret, BM_OK);
+    EXPECT_TRUE(seg.imports_.empty());
+    EXPECT_EQ(seg.mappedGvaMem_.size(), 0U);
+    EXPECT_EQ(HybmVaManager::GetInstance().GetAllocCount(), 1U);
+
+    auto outDva = HybmVaManager::GetInstance().TransformVa(remote.gva, HVM_GVA, HVM_DVA); // dva == 0
+    EXPECT_EQ(outDva, 0U);
+    auto outHva = HybmVaManager::GetInstance().TransformVa(remote.gva, HVM_GVA, HVM_HVA); // hva == 0
+    EXPECT_EQ(outHva, 0U);
+    EXPECT_FALSE(seg.CheckSdmaReaches(remote.rankId));
+}
+
+// ReserveLva 非56bit返回im.deviceVa
+TEST_F(HybmVmmBasedSegmentTest, ReserveLva_Non56Bit_ReturnsDeviceVa)
+{
+    MemSegmentOptions opts;
+    opts.enable56BitsGva = false;
+    HybmVmmBasedSegment seg(opts, 0);
+    HostSdmaExportInfo im;
+    im.magic = VMM_BASE_HBM_SLICE_EXPORT_INFO_MAGIC;
+    im.deviceVa = 0x1000;
+    im.size = 4096; // 4096
+    uint64_t lva = seg.ReserveLva(im);
+    EXPECT_EQ(lva, 0x1000U);
+}
+
+// ValidateOptions HBM通过
+TEST_F(HybmVmmBasedSegmentTest, ValidateOptions_Hbm_Passes)
+{
+    MemSegmentOptions opts;
+    opts.segType = HYBM_MST_HBM;
+    opts.maxSize = GB;
+    opts.rankCnt = 2; // 2
+    opts.size = 0;
+    HybmVmmBasedSegment seg(opts, 0);
+    EXPECT_EQ(seg.ValidateOptions(), BM_OK);
+}
+
+// 空析构不崩溃
+TEST_F(HybmVmmBasedSegmentTest, Destroy_NoCrash)
+{
+    MemSegmentOptions opts;
+    opts.segType = HYBM_MST_HBM;
+    HybmVmmBasedSegment seg(opts, 0);
+}
+
+// =========================
+// ValidateOptions / ReleaseSliceMemory / MemoryInRange 错误分支
+// =========================
+
+TEST_F(HybmVmmBasedSegmentTest, ValidateOptions_ErrorBranches)
+{
+    MemSegmentOptions opts;
+    opts.segType = HYBM_MST_DRAM;
+    opts.maxSize = GB;
+    opts.rankCnt = 2; // 2
+    // DRAM 段 size 需 GB 对齐 → 非法
+    opts.size = GB / 2; // 2
+    HybmVmmBasedSegment seg1(opts, 0);
+    EXPECT_EQ(seg1.ValidateOptions(), BM_INVALID_PARAM);
+
+    // maxSize 非 GB 对齐 → 非法
+    opts.size = 0;
+    opts.maxSize = HYBM_LARGE_PAGE_SIZE;
+    HybmVmmBasedSegment seg2(opts, 0);
+    EXPECT_EQ(seg2.ValidateOptions(), BM_INVALID_PARAM);
+
+    // rankCnt * maxSize 溢出 → 非法
+    opts.maxSize = GB;
+    opts.rankCnt = UINT32_MAX;
+    HybmVmmBasedSegment seg3(opts, 0);
+    EXPECT_EQ(seg3.ValidateOptions(), BM_INVALID_PARAM);
+
+    // 内存池 > 128T 且未启用 56 位 GVA → 非法
+    opts.maxSize = 64ULL * GB;
+    opts.rankCnt = 4096; // 4096
+    opts.enable56BitsGva = false;
+    HybmVmmBasedSegment seg4(opts, 0);
+    EXPECT_EQ(seg4.ValidateOptions(), BM_INVALID_PARAM);
+}
+
+TEST_F(HybmVmmBasedSegmentTest, ReleaseSliceMemory_ErrorPaths)
+{
+    MemSegmentOptions opts;
+    opts.segType = HYBM_MST_HBM;
+    opts.maxSize = GB;
+    opts.rankCnt = 1;
+    HybmVmmBasedSegment seg(opts, 0);
+
+    EXPECT_EQ(seg.ReleaseSliceMemory(nullptr), BM_INVALID_PARAM);
+
+    // slices_ 同 index 不同对象 → magic 不匹配
+    auto realSlice = std::make_shared<MemSlice>(5, HYBM_MEM_TYPE_DEVICE, MEM_PT_TYPE_GVM, 0x1000, 0x2000, 4096);
+    seg.slices_.emplace(realSlice->index_, MemSliceStatus(realSlice, nullptr));
+    auto fakeSlice = std::make_shared<MemSlice>(5, HYBM_MEM_TYPE_DEVICE, MEM_PT_TYPE_GVM, 0x1000, 0x2000, 4096);
+    EXPECT_EQ(seg.ReleaseSliceMemory(fakeSlice), BM_INVALID_PARAM);
+
+    // 不在任何容器 → not exist
+    auto unknown = std::make_shared<MemSlice>(99, HYBM_MEM_TYPE_DEVICE, MEM_PT_TYPE_GVM, 0x3000, 0x4000, 4096);
+    EXPECT_EQ(seg.ReleaseSliceMemory(unknown), BM_INVALID_PARAM);
+
+    // registerSlices_ 同 index 不同对象 → magic 不匹配
+    auto regSlice = std::make_shared<MemSlice>(7, HYBM_MEM_TYPE_HOST, MEM_PT_TYPE_GVM, 0x5000, 0x6000, 4096);
+    seg.registerSlices_.emplace(regSlice->index_, std::make_pair(MemSliceStatus(regSlice, nullptr), 0x7000ULL));
+    auto fakeReg = std::make_shared<MemSlice>(7, HYBM_MEM_TYPE_HOST, MEM_PT_TYPE_GVM, 0x5000, 0x6000, 4096);
+    EXPECT_EQ(seg.ReleaseSliceMemory(fakeReg), BM_INVALID_PARAM);
+}
+
+TEST_F(HybmVmmBasedSegmentTest, ReleaseRegisteredHostMemoryForDeviceUrma)
+{
+    MemSegmentOptions opts;
+    opts.segType = HYBM_MST_DRAM;
+    opts.dataOpType = static_cast<hybm_data_op_type>(HYBM_DOP_TYPE_SDMA | HYBM_DOP_TYPE_DEVICE_URMA);
+    HybmVmmBasedSegment seg(opts, 0);
+    auto slice = std::make_shared<MemSlice>(1, HYBM_MEM_TYPE_HOST, MEM_PT_TYPE_SVM, 0, 0x6000, 4096);
+    seg.registerSlices_.emplace(slice->index_, std::make_pair(MemSliceStatus(slice), 0x7000ULL));
+    MOCKER(&DlHalApi::HalHostUnregisterEx).expects(once()).will(returnValue(BM_OK));
+
+    EXPECT_EQ(seg.ReleaseSliceMemory(slice), BM_OK);
+    EXPECT_TRUE(seg.registerSlices_.empty());
+}
+
+TEST_F(HybmVmmBasedSegmentTest, MemoryInRange_ErrorBranches)
+{
+    MemSegmentOptions opts;
+    opts.segType = HYBM_MST_HBM;
+    opts.maxSize = GB;
+    opts.rankCnt = 1;
+    HybmVmmBasedSegment seg(opts, 0);
+    seg.globalVirtualAddress_ = reinterpret_cast<uint8_t *>(0x20000000);
+    seg.totalVirtualSize_ = GB;
+
+    EXPECT_FALSE(seg.MemoryInRange(reinterpret_cast<void *>(0x10000000), 4096)); // 4096
+    EXPECT_FALSE(seg.MemoryInRange(reinterpret_cast<void *>(0x20000000), static_cast<uint64_t>(GB) + 1));
+    EXPECT_TRUE(seg.MemoryInRange(reinterpret_cast<void *>(0x20000000), 4096)); // 4096
+}

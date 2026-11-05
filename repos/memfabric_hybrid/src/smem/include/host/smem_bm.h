@@ -1,0 +1,329 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+ * MemFabric_Hybrid is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ *          http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+ * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+*/
+#ifndef __MEMFABRIC_SMEM_BM_H__
+#define __MEMFABRIC_SMEM_BM_H__
+
+#include "smem.h"
+#include "smem_bm_def.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief Set the config to default values
+ *
+ * @param config           [in] the config to be set
+ * @return 0 if successful
+ */
+int32_t smem_bm_config_init(smem_bm_config_t *config);
+
+/**
+ * @brief Initialize Big Memory library, which composes device memory on many NPUs and host memory on many hosts
+ * into global shared memory space for high throughput data store or data transfer.
+ * For instance, user can store KVCache into the global shared memory for reuse. i.e. Once a worker generates
+ * the KVBlocks then copy to global shared memory space, other workers can read it
+ * by data copy as well.
+ *
+ * @param storeURL         [in] configure store url for control,
+ *                              e.g. tcp://ip:port, tcp://[ip]:port, etcd://[ip]:port,
+ *                              etcd://[ip]:port#instanceId, reg://[ip]:port,
+ *                              or reg://[ip]:port#instanceId (for multi-cluster isolation)
+ * @param worldSize        [in] number of guys participating
+ * @param deviceId         [in] device id
+ * @param config           [in] extract config
+ * @return 0 if successful
+ */
+int32_t smem_bm_init(const char *storeURL, uint32_t worldSize, uint16_t deviceId, const smem_bm_config_t *config);
+
+/**
+ * @brief Un-initialize the Big Memory library
+ *
+ * @param flags            [in] optional flags, not used yet
+ */
+void smem_bm_uninit(uint32_t flags);
+
+/**
+ * @brief Get the rank id, assigned during initialization i.e. after call <i>smem_bm_init</i>
+ *
+ * @return rank id if successful, UINT32_MAX is returned if failed
+ */
+uint32_t smem_bm_get_rank_id(void);
+
+/**
+ * @brief Update the config store server address and reconnect.
+ *
+ * Called when the config store leader has changed. The rank's config store
+ * client will disconnect from the old leader and connect to the new one.
+ *
+ * @param ip    New leader's IP address
+ * @param port  New leader's config store port
+ * @return 0 on success, non-zero error code on failure
+ */
+int32_t smem_bm_update_store_server(const char *ip, uint16_t port);
+
+/**
+ * @brief Get the bindable upper leader address registered by the current config store leader.
+ *
+ * Used by upper-layer applications to discover the bindable upper leader endpoint in
+ * HA mode: the config store leader publishes the upper leader's address to the
+ * config store backend, and this returns the currently registered one regardless
+ * of whether the caller itself is the config store leader.
+ *
+ * @param ip         [out] buffer to receive the upper leader IP (at least 64 bytes)
+ * @param ipLen      [in] size of the ip buffer
+ * @param port       [out] upper leader bind port
+ * @return 0 on success, non-zero error code on failure
+ */
+int32_t smem_bm_get_bindable_leader_address(char *ip, size_t ipLen, uint16_t *port);
+
+/**
+ * @brief Read the bindable leader address published in the config store, without creating a BM.
+ *
+ * For client-only processes (e.g. a scheduler that must not register a rank) that
+ * need the HA-discovered upper leader address. A client-only config store is
+ * created lazily for storeUrl and cached in the process (so repeated discovery
+ * does not churn etcd connections); release it with smem_bm_release_leader_address_store.
+ * In non-etcd deployments prefer smem_bm_get_bindable_leader_address / the static URL.
+ *
+ * @param storeUrl   [in] config store URL, e.g. etcd://ip:port#instanceId
+ * @param tlsOption  [in] config store TLS; NULL when TLS is disabled
+ * @param worldSize  [in] world size, must match the upper leader/local service (default 256)
+ * @param ip         [out] buffer receiving the upper leader IP
+ * @param ipLen      [in] capacity of ip, including the null terminator
+ * @param port       [out] upper leader bind port
+ * @return 0 on success; non-zero on failure, and the caller may fall back to a static URL
+ */
+int32_t smem_bm_get_bindable_leader_address_by_store_url(const char *storeUrl, const smem_tls_config *tlsOption,
+                                                         uint32_t worldSize, char *ip, size_t ipLen, uint16_t *port);
+
+/**
+ * @brief Release the client-only discovery store cached by
+ *        smem_bm_get_bindable_leader_address_by_store_url.
+ *
+ * Call on client shutdown; safe to call when nothing was cached.
+ */
+void smem_bm_release_leader_address_store(void);
+
+/**
+ * @brief Register a callback invoked when the HA leader changes.
+ *
+ * Pure notification: the library does not fetch or pass any address. The caller
+ * decides what to do on upper leader change (e.g. re-read the leader address via
+ * smem_bm_get_bindable_leader_address and switch its connections). Used to cover
+ * SIGSTOP-like failures where the old leader stays ESTABLISHED and no TCP
+ * link-broken event is delivered to clients.
+ *
+ * Only meaningful in etcd/HA mode; returns non-zero when the config store is
+ * not HA (caller may treat this as "not supported" and skip).
+ *
+ * The callback runs on the HA re-election thread inside the library and should
+ * return quickly. It is not invoked for the leader node's own transitions.
+ *
+ * @param callback    [in] invoked as callback(userData); may be NULL to unregister
+ * @param userData    [in] opaque user data passed back to the callback
+ * @return 0 on success, non-zero error code on failure
+ */
+typedef void (*smem_bm_leader_change_cb)(void *userData);
+int32_t smem_bm_register_leader_change_callback(smem_bm_leader_change_cb callback, void *userData);
+
+/**
+ * @brief Create a Big Memory object locally after initialized, this only create local memory segment and after
+ * call <i>smem_bm_join</i> the local memory segment will be joined into global space. One Big Memory object is
+ * a global memory space, data operation does work across different Big Memory object.
+ * We need to specify different <i>id</i> for different Big Memory object.
+ *
+ * @param id               [in] identity of the Big Memory object
+ * @param memberSize       [in] number of guys participating, which should equal or less the world size
+ * @param dataOpType       [in] data operation type, SDMA or RoCE etc
+ * @param localDRAMSize    [in] the size of local DRAM memory contributes to Big Memory object
+ * @param localHBMSize     [in] the size of local HBM memory contributes to Big Memory object
+ * @param flags            [in] optional flags
+ * @return Big Memory object handle if successful, nullptr if failed
+ */
+smem_bm_t smem_bm_create(uint32_t id, uint32_t memberSize, smem_bm_data_op_type_t dataOpType, uint64_t localDRAMSize,
+                         uint64_t localHBMSize, uint32_t flags);
+
+/**
+ * @brief Create a Big Memory object locally after initialized, this only create local memory segment and after
+ * call <i>smem_bm_join</i> the local memory segment will be joined into global space. One Big Memory object is
+ * a global memory space, data operation does work across different Big Memory object.
+ * We need to specify different <i>id</i> for different Big Memory object.
+ *
+ * @param id               [in] identity of the Big Memory object
+ * @param option           [in] smme bm create option
+ * @return Big Memory object handle if successful, nullptr if failed
+ */
+smem_bm_t smem_bm_create2(uint32_t id, const smem_bm_create_option_t *option);
+
+/**
+ * @brief Destroy the Big Memory object
+ *
+ * @param handle           [in] the Big Memory object to be destroyed
+ */
+void smem_bm_destroy(smem_bm_t handle);
+
+/**
+ * @brief Join to global Big Memory space actively, after this, we can operate on the global space,
+ * i.e. use <i>smem_bm_ptr</i> to get peer gva address and use <i>smem_bm_copy</i> to do data copy
+ *
+ * @param handle           [in] Big Memory object handle created by <i>smem_bm_create</i>
+ * @param flags            [in] optional flags
+ * @return 0 if successful
+ */
+int32_t smem_bm_join(smem_bm_t handle, uint32_t flags);
+
+/**
+ * @brief Leave the global Big Memory space actively, after this, we cannot operate on the global space anymore
+ *
+ * @param handle           [in] Big Memory object handle created by <i>smem_bm_create</i>
+ * @param flags            [in] optional flags
+ * @return 0 if successful
+ */
+int32_t smem_bm_leave(smem_bm_t handle, uint32_t flags);
+
+/**
+ * @brief extend memory for local rank, all alloc memory must range in reserved memory
+ * @param handle           [in] Big Memory object handle created by <i>smem_bm_create</i>
+ * @param memType          [in] memory type
+ * @param size             [in] memory size
+ * @return o if successful
+ */
+int32_t smem_bm_extend_local_mem(smem_bm_t handle, smem_bm_mem_type_t memType, uint64_t size);
+
+/**
+ * @brief Get the size of memory allocated locally by memory type
+ *
+ * @param handle           [in] Big Memory object handle created by smem_bm_create
+ * @param memType          [in] memory type, device or host
+ * @return local memory size in bytes
+ */
+uint64_t smem_bm_get_local_mem_size_by_mem_type(smem_bm_t handle, smem_bm_mem_type_t memType);
+
+/**
+ * @brief Get GVA by memory type and rank id
+ *
+ * @param handle           [in] Big Memory object handle created by smem_bm_create
+ * @param memType          [in] memory type, SMEM_MEM_TYPE_DEVICE or SMEM_MEM_TYPE_HOST
+ * @param peerRankId       [in] rank id of peer
+ * @return memory ptr of peer gva; start address of GVA when peerRankId = 0
+ */
+void *smem_bm_ptr_by_mem_type(smem_bm_t handle, smem_bm_mem_type_t memType, uint16_t peerRankId);
+
+/**
+ * @brief Convert GVA (Global Virtual Address) to VA (Virtual Address) with specified memory type
+ *
+ * @param handle           [in] Big Memory object handle created by <i>smem_bm_create</i>
+ * @param gva              [in] Global virtual address
+ * @param vaMemType        [in] Output va memory type, only SMEM_MEM_TYPE_LOCAL_DEVICE or SMEM_MEM_TYPE_LOCAL_HOST
+ *                              are supported
+ * @param va               [out] Converted virtual address
+ * @return 0 if successful, error code otherwise
+ */
+int32_t smem_bm_gva_to_va(smem_bm_t handle, void *gva, smem_bm_mem_type_t vaMemType, void **va);
+
+/**
+ * @brief Data copy on Big Memory object, several copy types supported:
+ * L2G: local memory to global space
+ * G2L: global space to local memory
+ * G2H: global space to host memory
+ * H2G: host memory to global space
+ *
+ * @param handle           [in] Big Memory object handle created by <i>smem_bm_create</i>
+ * @param params           [in] Pointer to the batch copy parameter structure
+ *                              - src: source gva of data
+ *                              - dest: target gva of data
+ *                              - size: size of data to be copied
+ * @param t                [in] copy type, L2G, G2L, G2H, H2G
+ * @param flags            [in] optional flags
+ * @return 0 if successful
+ */
+int32_t smem_bm_copy(smem_bm_t handle, smem_copy_params_t *params, smem_bm_copy_type_t t, uint32_t flags);
+
+/**
+ * @brief Perform batch data copy operations on Big Memory
+ * @param handle           [in] Big Memory object handle, created and returned by the smem_bm_create function,
+ *                              used to identify the target shared memory instance
+ * @param params           [in] Pointer to the batch copy parameter structure
+ *                              - sources: Pointer to an array of source addresses
+ *                              - destinations: Pointer to an array of destination addresses
+ *                              - dataSizes: Pointer to an array of data lengths
+ *                              - batchSize: Number of copy groups in the batch
+ * @param t                [in] copy type, L2G, G2L, G2H, H2G
+ * @param flags            [in] optional flags
+ * @return 0 if successful
+ */
+int32_t smem_bm_copy_batch(smem_bm_t handle, smem_batch_copy_params_t *params, smem_bm_copy_type_t t, uint32_t flags);
+
+/**
+ * @brief Wait all issued async copy(s) finish
+ *
+ * @return 0 if successful
+ */
+int32_t smem_bm_wait(smem_bm_t handle);
+
+/**
+ * @brief Register hbm mem, support sdma or rdma
+ *
+ * @param handle           [in] Big Memory object handle created by <i>smem_bm_create</i>
+ * @param addr             [in] register addr
+ * @param size             [in] register size
+ */
+int32_t smem_bm_register_user_mem(smem_bm_t handle, uint64_t addr, uint64_t size);
+
+/**
+ * @brief UnRegister hbm mem, support sdma or rdma
+ *
+ * @param handle           [in] Big Memory object handle created by <i>smem_bm_create</i>
+ * @param addr             [in] unregister addr
+ */
+int32_t smem_bm_unregister_user_mem(smem_bm_t handle, uint64_t addr);
+
+/**
+ * @brief Get rank id of gva that belongs to
+ *
+ * @param handle           [in] Big Memory object handle created by <i>smem_bm_create</i>
+ * @param gva              [in] global virtual address
+ * @return rank id if successful, UINT32_MAX is returned if failed
+ */
+uint32_t smem_bm_get_rank_id_by_gva(smem_bm_t handle, void *gva);
+
+/**
+ * @brief Update the config store URL after smem_bm_init, used when the upper leader restarts with a new IP.
+ * This function lazily updates the config store connection target without recreating the store.
+ * The new URL is set on the underlying TcpConfigStore and the existing reconnection mechanism
+ * (ReConnectAfterBroken) will automatically establish a connection using the new address.
+ * The rank ID and world size remain unchanged.
+ *
+ * @param storeURL         [in] new configure store url, e.g. tcp://ip:port
+ * @return 0 if successful, negative value for error
+ */
+int32_t smem_bm_update_store_url(const char *storeURL);
+
+/**
+ * @brief Set group event handler for a BigMemory object.
+ * @deprecated This API is retained as a no-op stub for binary compatibility.
+ *            Group events are now handled internally by the server-driven
+ *            async join scheme. The callback will never be invoked.
+ *
+ * @param handle  [in] BigMemory handle created by <i>smem_bm_create</i>
+ * @param cb      [in] callback for group events — NOT invoked
+ * @param context [in] user context — NOT passed
+ * @return 0
+ */
+int32_t smem_bm_set_group_event_handler(smem_bm_t handle, smem_bm_group_event_cb cb, void *context);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif //__MEMFABRIC_SMEM_BM_H__

@@ -1,0 +1,57 @@
+# ----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------------------------------------
+
+# Markdown link checker configuration for lychee.
+# The hook runs during pre-commit and can also be invoked manually for full docs/examples scans.
+
+verbose = "warn"
+no_progress = true
+
+max_redirects = 10
+max_retries = 2
+retry_wait_time = 2
+timeout = 20
+max_concurrency = 16
+method = "get"
+
+# 429 is usually a rate-limit response from public documentation or code-hosting
+# sites. Keep it non-blocking so one busy host does not fail an unrelated push.
+accept = ["200..=299", "429"]
+
+hidden = true
+include_verbatim = false
+include_mail = false
+# include_fragments = "anchor-only"
+extensions = ["md", "markdown", "mdx"]
+
+exclude_loopback = true
+exclude_link_local = true
+exclude_private = true
+
+exclude = [
+    "^https://code\\.visualstudio\\.com/",
+    "^https://docs\\.docker\\.com/engine/install/",
+    "^https://gitee\\.com/ascend/samples/tree/master/operator/ascendc$",
+    "^https://gitee\\.com/ascend/samples/tree/master/operator/ascendc/0_introduction/3_add_kernellaunch/AddKernelInvocationNeo$",
+    "^https://gitee\\.com/ascend/ascendc-api-adv/tree/master/examples$",
+    "^https://github\\.com/openai/triton$",
+    "^https://github\\.com/tile-ai/tilelang-ascend$",
+    "^https://github\\.com/nlohmann/json/blob/develop/include/nlohmann/json\\.hpp$",
+    "^https://github\\.com/ImageMagick/ImageMagick-Windows/releases$",
+    "^https://docs\\.docker\\.com/$",
+    "^https://docs\\.docker\\.com/reference/cli/docker/buildx/$",
+    "^https://ccache\\.dev/documentation\\.html$",
+    "//img\\.shields\\.io/badge/",
+]
+
+exclude_path = [
+    "^tests/api/adv_api/hccl/cc/st/algorithm/README\\.md$",
+    "^tests/api/adv_api/hccl/cc/st/algorithm/README_en\\.md$",
+]

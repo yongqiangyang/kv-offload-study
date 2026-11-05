@@ -1,0 +1,221 @@
+# Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+# MemFabric_Hybrid is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#          http://license.coscl.org.cn/MulanPSL2
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+
+"""python api for memfabric_hybrid."""
+
+import glob
+import os
+import platform
+import shutil
+import subprocess
+import sys
+
+from setuptools import find_namespace_packages, setup
+from setuptools.command.build_py import build_py
+from setuptools.dist import Distribution
+from wheel.bdist_wheel import bdist_wheel
+
+
+def check_env_flag(name: str, default: str = "") -> bool:
+    return os.getenv(name, default).upper() in ["ON", "1", "YES", "TRUE", "Y"]
+
+
+# 消除 whl 压缩包的时间戳差异。ZIP 时间戳最早支持到
+# 1980-01-01，不能使用 Unix epoch（1970-01-01）。
+os.environ["SOURCE_DATE_EPOCH"] = "315532800"
+current_version = os.getenv("MEMFABRIC_VERSION")
+if not current_version:
+    print("Error: MEMFABRIC_VERSION environment variable must be set.", file=sys.stderr)
+is_manylinux = check_env_flag("IS_MANYLINUX", "FALSE")
+xpu_type = os.getenv("XPU_TYPE", "NPU")
+
+if xpu_type not in ("NPU", "NONE", "GPU"):
+    raise ValueError("XPU_TYPE must be exactly NPU, NONE, or GPU")
+if xpu_type == "NONE":
+    current_version += "+cpu"
+elif xpu_type == "GPU":
+    current_version += "+gpu"
+
+
+_PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "../../../.."))
+
+# zbal package staged by script/build.sh (BUILD_ZBAL=ON); its prebuilt zbal_a3/zbal_a5 .so
+# ship as package data, so a single wheel installs both `memfabric_hybrid` and `zbal`.
+_zbal_staged = os.path.isdir(os.path.join(os.path.dirname(__file__), "zbal"))
+
+# acc_offload extend sources, staged into the wheel under _kernel/acc_offload (sibling of the
+# prebuilt AICPU payload _kernel/hybm) for install-time compilation. NPU wheels only.
+_ACC_OFFLOAD_SRC_ASSETS = [
+    ("_kernel/acc_offload/operators", "src/acc_offload/csrc/operators"),
+    (
+        "_kernel/acc_offload/launch/acc_offload_operators_launch.cpp",
+        "src/acc_offload/csrc/launch/acc_offload_operators_launch.cpp",
+    ),
+]
+
+# Placeholder file shipped in the wheel lib dir; the install-time build overwrites
+# it with the real .so (empty placeholder = not built yet).
+_EXTEND_PLACEHOLDER_FILES = [
+    "lib/libmf_hybm_accoffload.so",
+]
+
+
+def _copy_acc_offload_assets(build_lib):
+    """Stage acc_offload extend sources and placeholder files into build_lib (NPU wheels only)."""
+    if xpu_type != "NPU":
+        return
+    pkg_build = os.path.join(build_lib, "memfabric_hybrid")
+    # Refresh only the acc_offload subtree: _kernel/hybm holds the prebuilt AICPU payload that
+    # build_py already copied from the source tree and must survive.
+    src_dir = os.path.join(pkg_build, "_kernel", "acc_offload")
+    if os.path.isdir(src_dir):
+        shutil.rmtree(src_dir)
+    for rel_dst, rel_src in _ACC_OFFLOAD_SRC_ASSETS:
+        dst_full = os.path.join(pkg_build, rel_dst)
+        os.makedirs(os.path.dirname(dst_full), exist_ok=True)
+        full_src = os.path.join(_PROJECT_ROOT, rel_src)
+        if os.path.isdir(full_src):
+            shutil.copytree(full_src, dst_full)
+        else:
+            shutil.copy2(full_src, dst_full)
+    lib_dir = os.path.join(pkg_build, "lib")
+    os.makedirs(lib_dir, exist_ok=True)
+    for rel in _EXTEND_PLACEHOLDER_FILES:
+        path = os.path.join(pkg_build, rel)
+        if not os.path.exists(path):
+            with open(path, "w") as f:
+                f.write("")
+    marker = os.path.join(pkg_build, ".acc_offload_provision_wheel_only")
+    with open(marker, "w") as f:
+        f.write("")
+
+
+class _BuildPy(build_py):
+    """Custom build_py staging acc_offload extend sources into build_lib (NPU wheels only)."""
+
+    def run(self):
+        super().run()
+        _copy_acc_offload_assets(self.build_lib)
+
+
+class BinaryDistribution(Distribution):
+    """Distribution which always forces a binary package with platform name"""
+
+    def has_ext_modules(self):
+        return True
+
+
+class BuildWheel(bdist_wheel):
+    def run(self):
+        if self.skip_build:
+            self.run_command("build_py")
+        bdist_wheel.run(self)
+
+        auditwheel = shutil.which("auditwheel")
+        if not auditwheel:
+            print(
+                "Warning: auditwheel is not installed. Skipping wheel repair. "
+                "Please install auditwheel if repaired wheels are required.",
+                file=sys.stderr,
+            )
+            return
+
+        # Keep a single copy of memfabric's own libs: they are already shipped
+        # under <pkg>/lib/ and preloaded via ctypes in __init__.py. Without
+        # exclude, auditwheel copies them again into <pkg>/.libs/ and rewrites
+        # RPATHs, so both copies get loaded and destroyed -> double free.
+        exclude_libraries = [
+            "libmf_smem.so",
+            "libmf_hybm_core.so",
+            "libmf_acc_offload.so",
+            "libboundscheck.so",
+        ]
+        if _zbal_staged:
+            # zbal's extensions resolve torch/CANN libs at runtime via `import torch`;
+            # mirrors the exclude list of app/zbal's own BuildWheel.
+            exclude_libraries += [
+                "libtorch.so",
+                "libtorch_npu.so",
+                "libc10.so",
+                "libtorch_python.so",
+                "libtorch_cpu.so",
+                "libopapi.so",
+            ]
+
+        file = glob.glob(os.path.join(self.dist_dir, "*-linux_*.whl"))[0]
+        if is_manylinux:
+            auditwheel_cmd = [
+                auditwheel,
+                "-v",
+                "repair",
+                "--plat",
+                f"manylinux_2_27_{platform.machine()}",
+                "--plat",
+                f"manylinux_2_28_{platform.machine()}",
+                "-w",
+                self.dist_dir,
+            ]
+        else:
+            auditwheel_cmd = [
+                auditwheel,
+                "-v",
+                "repair",
+                "-w",
+                self.dist_dir,
+            ]
+        for lib in exclude_libraries:
+            auditwheel_cmd.extend(["--exclude", lib])
+        auditwheel_cmd.append(file)
+        subprocess.check_call(auditwheel_cmd)
+        os.remove(file)
+
+
+pkgs = find_namespace_packages()
+print(pkgs)
+
+setup(
+    name="memfabric_hybrid",
+    version=current_version,
+    author="",
+    author_email="",
+    description="python api for memfabric hybrid",
+    packages=find_namespace_packages(exclude=("tests*",)),
+    url="https://gitcode.com/Ascend/memfabric_hybrid",
+    license="Mulan PSL v2",
+    python_requires=">=3.10",
+    zip_safe=False,
+    package_data={
+        "memfabric_hybrid": [
+            "_pymf_hybrid*.so",
+            "_pymf_transfer*.so",
+            "_pymf_acc_offload*.so",
+            "lib/lib*.so",
+            "include/smem/host/*.h",
+            "include/smem/device/*.h",
+            "include/hybm/*.h",
+            "VERSION",
+            "logs/collect_logs.sh",
+            "_kernel/hybm/*",
+            "_kernel/acc_offload/operators/*",
+            "_kernel/acc_offload/launch/*",
+        ],
+        "zbal": ["zbal*.so", "VERSION"],
+    },
+    entry_points={
+        "console_scripts": [
+            "mfcli=memfabric_hybrid.cli:main",
+        ]
+    },
+    cmdclass={
+        "build_py": _BuildPy,
+        "bdist_wheel": BuildWheel,
+    },
+    distclass=BinaryDistribution,
+)

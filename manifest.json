@@ -1,0 +1,80 @@
+{
+  "checked_on": "2026-11-04",
+  "timezone": "Asia/Shanghai",
+  "repositories": [
+    {
+      "name": "Mooncake",
+      "path": "repos/Mooncake",
+      "origin": "https://github.com/kvcache-ai/Mooncake.git",
+      "commit": "4704c67f13ffbada9fbe7785d854c0a53e1e73b4",
+      "commit_date": "2026-11-04T17:48:39+08:00",
+      "snapshot_files": 2953,
+      "absent_index_entries": 1,
+      "scope": "checked-out tracked source files; no upstream Git history or initialized submodules"
+    },
+    {
+      "name": "asc-devkit",
+      "path": "repos/asc-devkit",
+      "origin": "https://gitcode.com/cann/asc-devkit.git",
+      "commit": "46fbef005e5fd04e430b5f1049e9a908382fa296",
+      "commit_date": "2026-11-04T17:46:53+08:00",
+      "snapshot_files": 867,
+      "absent_index_entries": 14754,
+      "scope": "checked-out tracked source files; no upstream Git history or initialized submodules"
+    },
+    {
+      "name": "memfabric_hybrid",
+      "path": "repos/memfabric_hybrid",
+      "origin": "https://gitcode.com/Ascend/memfabric_hybrid.git",
+      "commit": "f6bc00e251524a21fa2e2a9f8ef2d028df9991b6",
+      "commit_date": "2026-11-04T11:19:27+08:00",
+      "snapshot_files": 1247,
+      "absent_index_entries": 2,
+      "scope": "checked-out tracked source files; no upstream Git history or initialized submodules"
+    },
+    {
+      "name": "memfabric_hybrid-github-mirror",
+      "path": "repos/memfabric_hybrid-github-mirror",
+      "origin": "https://github.com/Ascend/memfabric_hybrid.git",
+      "commit": "004d9317289fe99bd6bf13def0500b3fa3795ccc",
+      "commit_date": "2026-06-03T19:05:21+08:00",
+      "snapshot_files": 839,
+      "absent_index_entries": 2,
+      "scope": "checked-out tracked source files; no upstream Git history or initialized submodules"
+    },
+    {
+      "name": "vllm",
+      "path": "repos/vllm",
+      "origin": "https://github.com/vllm-project/vllm.git",
+      "commit": "5225a1f17f9cf721efd5ad793e6b63798ca30306",
+      "commit_date": "2026-11-04T07:12:11+00:00",
+      "snapshot_files": 8886,
+      "absent_index_entries": 0,
+      "scope": "checked-out tracked source files; no upstream Git history or initialized submodules"
+    },
+    {
+      "name": "vllm-ascend",
+      "path": "repos/vllm-ascend",
+      "origin": "https://github.com/vllm-project/vllm-ascend.git",
+      "commit": "bee583c95f7e3222fd79a4deba206a6b2d9694b3",
+      "commit_date": "2026-11-04T14:48:02+08:00",
+      "snapshot_files": 4716,
+      "absent_index_entries": 1,
+      "scope": "checked-out tracked source files; no upstream Git history or initialized submodules"
+    }
+  ],
+  "release": {
+    "filename": "memfabric_hybrid-1.3.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    "url": "https://files.pythonhosted.org/packages/ba/87/935b3625797722d85197a258c959b8211f2aaaf763ef2183b4cdca4681fa/memfabric_hybrid-1.3.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    "sha256": "3b60415c8ca9790fb87394d0d6738859f586276dc8b5e3b26434d255c349a88e",
+    "installed": false,
+    "python_and_kernel_sources_extracted": true
+  },
+  "validation": "Static source inspection only; no NPU/CANN build or runtime verification.",
+  "publication": {
+    "source_snapshots": true,
+    "nested_git_directories_included": false,
+    "wheel_binary_included": false,
+    "note": "asc-devkit is the checked-out sparse subset. See snapshot_files and absent_index_entries. Source licenses remain in each repository."
+  }
+}

@@ -1,0 +1,230 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+ * MemFabric_Hybrid is licensed under Mulan PSL v2.
+ * You can use this software according to the terms and conditions of the Mulan PSL v2.
+ * You may obtain a copy of Mulan PSL v2 at:
+ *          http://license.coscl.org.cn/MulanPSL2
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+ * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+ * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ * See the Mulan PSL v2 for more details.
+ */
+#ifndef SMEM_SMEM_HA_CONFIG_STORE_H
+#define SMEM_SMEM_HA_CONFIG_STORE_H
+
+#include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <shared_mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#include "smem_bm_def.h"
+#include "smem_config_store_logger.h"
+#include "smem_config_store.h"
+#include "smem_logger.h"
+#include "smem_tcp_config_store.h"
+#include "smem_types.h"
+
+namespace ock {
+namespace smem {
+
+constexpr uint32_t MAX_RETRY_COUNT = 10;
+constexpr uint32_t RETRY_INTERVAL_MS = 500;
+
+// Network connectivity check timeout
+constexpr int32_t CONNECTION_TIMEOUT_SEC = 3;
+
+// Random sleep range for leader election backoff
+constexpr int32_t MIN_SLEEP_MS = 100;
+constexpr int32_t MAX_SLEEP_MS = 1000;
+
+// Backend lease TTL
+constexpr int32_t PUT_LEASE_TTL_SEC = 5;
+
+// Health check interval
+constexpr uint32_t HEALTH_CHECK_INTERVAL_SEC = 4;
+
+/**
+ * @brief HaConfigStore manages leader election via backend and delegates operations
+ * to TCP client.
+ */
+class HaConfigStore : public ConfigStoreManager {
+public:
+    HaConfigStore(StoreBackendPtr backend, TcpConfigStorePtr clientDelegate, const std::string &endpoints,
+                  uint32_t worldSize, uint16_t model = 0);
+    ~HaConfigStore() override;
+
+    HaConfigStore(const HaConfigStore &) = delete;
+    HaConfigStore &operator=(const HaConfigStore &) = delete;
+
+    /**
+     * @brief Initialize the hybrid store and start the election state machine.
+     */
+    [[nodiscard]] Result Startup(const smem_tls_config &tlsConfig) noexcept;
+
+    // --- ConfigStore Interface Implementation (Forwarding to clientDelegate_) ---
+    Result PrefixGet(const std::string &key, std::unordered_map<std::string, std::string> &value) noexcept override;
+    [[nodiscard]] Result Set(const std::string &key, const std::vector<uint8_t> &value) noexcept override;
+    [[nodiscard]] Result Add(const std::string &key, int64_t increment, int64_t &value) noexcept override;
+    [[nodiscard]] Result Remove(const std::string &key, bool printKeyNotExist) noexcept override;
+    [[nodiscard]] Result Append(const std::string &key, const std::vector<uint8_t> &value,
+                                uint64_t &newSize) noexcept override;
+    [[nodiscard]] Result Cas(const std::string &key, const std::vector<uint8_t> &expect,
+                             const std::vector<uint8_t> &value, std::vector<uint8_t> &exists) noexcept override;
+    [[nodiscard]] Result
+    Watch(const std::string &key,
+          const std::function<void(int result, const std::string &, const std::vector<uint8_t> &)> &notify,
+          uint32_t &wid) noexcept override;
+    [[nodiscard]] Result Watch(WatchRankType type, const std::function<void(WatchRankType, uint32_t, Result)> &notify,
+                               uint32_t &wid) noexcept override;
+    [[nodiscard]] Result Unwatch(uint32_t wid) noexcept override;
+    [[nodiscard]] Result Write(const std::string &key, const std::vector<uint8_t> &value,
+                               uint32_t offset) noexcept override;
+    [[nodiscard]] Result QueryAlive(uint32_t rank, uint32_t &alive) noexcept override;
+    void SetRankId(const int32_t &rankId) noexcept override;
+    std::string GetCompleteKey(const std::string &key) noexcept override;
+    std::string GetCommonPrefix() noexcept override;
+    StorePtr GetCoreStore() noexcept override;
+    HaConfigStore *AsHaConfigStore() noexcept override;
+
+    // --- Connection and Lifecycle Management ---
+    void RegisterReconnectHandler(ConfigStoreReconnectHandler callback) noexcept override;
+    [[nodiscard]] Result ReConnectAfterBroken(int reconnectRetryTimes) noexcept override;
+    [[nodiscard]] bool GetConnectStatus() noexcept override;
+    void SetConnectStatus(bool status) noexcept override;
+    void RegisterClientBrokenHandler(const ConfigStoreClientBrokenHandler &handler) noexcept override;
+    void RegisterServerBrokenHandler(const ConfigStoreServerBrokenHandler &handler) noexcept override;
+    uint32_t GetRankIdByLinkId(uint32_t linkId) const noexcept override;
+
+    TcpConfigStore *GetTcpStore() noexcept
+    {
+        return clientDelegate_ != nullptr ? clientDelegate_.Get() : nullptr;
+    }
+    bool IsLeader() const noexcept
+    {
+        return isLeader_.load(std::memory_order_acquire);
+    }
+
+    struct LeaderAddresses {
+        bool isLeader;
+        std::string bindableLeaderAddress;
+    };
+
+    using LeaderChangeCallback = std::function<void(const LeaderAddresses &)>;
+    void RegisterLeaderChangeCallback(LeaderChangeCallback cb) noexcept
+    {
+        leaderChangeCallback_ = std::move(cb);
+        // 选举在注册回调前已同步完成，若已是 leader 则补发一次当前状态。
+        if (leaderChangeCallback_ && IsLeader()) {
+            NotifyLeaderChange();
+        }
+    }
+
+    void GetClusterStatusJson(std::string &out) noexcept override;
+
+    StoreBackendPtr GetBackend() const noexcept
+    {
+        std::lock_guard<std::mutex> lock(backendMutex_);
+        return backend_;
+    }
+
+protected:
+    [[nodiscard]] Result GetReal(const std::string &key, std::vector<uint8_t> &value,
+                                 int64_t timeoutMs) noexcept override;
+
+private:
+    // Internal State Machine Logic
+    void RandomBackoff() noexcept;
+    void RunElectionLoop() noexcept;
+    bool HandleLeaderExists(const std::string &leaderAddr) noexcept;
+    bool TryAcquireLeadership(bool &becameLeader, uint32_t electionAttempt) noexcept;
+    Result BecomeFollower(const std::string &leaderIpPort) noexcept;
+    // CSM_CLIENT (rank/local-service) 专用：读取 backend 当前 leader 并作为
+    // follower 连接，周期性重试直到成功或 stop。
+    void ConnectToLeaderAsFollower() noexcept;
+    void StartServer() noexcept;
+    void StopServer() noexcept;
+    Result ConnectClient(const std::string &ip, uint16_t port, int reconnectRetryTimes = -1) noexcept;
+    void HealthCheckThreadFunc() noexcept;
+    // etcd 健康检查连续失败后，本轮是否可容忍（跳过 StopServer/重选）。纯判定，便于 UT 覆盖：
+    // clientOnly      : 本进程是否 CSM_CLIENT（链路指向远端 leader，链路存活即数据面可用）；
+    // isLeader        : 本进程当前是否 leader（其 KEY_LEADER 受 PUT_LEASE_TTL_SEC 租约约束）；
+    // leaderLinkAlive : clientOnly 下到远端 leader 的直连链路是否存活。
+    [[nodiscard]] static bool MayTolerateBackendFail(int consecutiveFails, bool clientOnly, bool isLeader,
+                                                     bool leaderLinkAlive) noexcept;
+    /**
+     * 校验etcd中的leader(backendLeader)和本进程所连接的leader(lastConnectedLeader_)的一致性；
+     * lastConnectedLeader_为空： 尚未建立连接由连接循环自身负责
+     * lastConnectedLeader_== backendLeader: 正常情况
+     * lastConnectedLeader_!= backendLeader && isLeader_:
+     *      所连接的leader与etcd记录的leader不一致，且本进程isLeader;
+     *      1. 如果重选举进行中: 交给重选举流程
+     *      2. 否则，触发本进程降级流程，停止本进程server服务，投入重选举流程；
+     * lastConnectedLeader_!= backendLeader && !isLeader_: 投入重选举流程；
+     * @param backendLeader: etcd中的leader
+     */
+    void CheckLeaderConsistency(const std::string &backendLeader) noexcept;
+    void Uninitialize() noexcept;
+
+    // Helper methods
+    [[nodiscard]] bool InitBackendConnection() noexcept;
+    [[nodiscard]] Result TryBecomeLeader() noexcept;
+    [[nodiscard]] bool IsLeaderAlive(std::string &leaderAddr) noexcept;
+    // 本进程登记到 backend 的 leader 地址（tcp:// 之后部分），格式与 KEY_LEADER 中的值逐字节一致；
+    // 尚未确定绑定地址时返回空串。用于识别“KEY_LEADER 指向本节点”，避免leader把自己当其它主降级。
+    [[nodiscard]] std::string BuildSelfLeaderAddr() const noexcept;
+    void StartHealthCheckThread() noexcept;
+    void TriggerReElectionAsync() noexcept;
+    void ReElectionThreadFunc();
+    void NotifyLeaderChange() noexcept;
+
+private:
+    // Configuration Attributes
+    const std::string endpoints_;
+    const uint32_t worldSize_;
+    const std::string backendLockName_;
+    const uint16_t model_ = 0;
+    std::string leaderBindIp_;           // Only meaningful on leader node
+    uint16_t leaderBindPort_ = 0;        // Only meaningful on leader node
+    uint16_t leaderAddressBindPort_ = 0; // leader bind port, selected from port range excluding leaderBindPort_
+    bool isFirstLeader_ = true;
+    smem_tls_config tlsConfig_{};
+
+    mutable std::shared_mutex delegateRwLock_;
+    StoreBackendPtr backend_;
+    mutable std::mutex backendMutex_;
+    TcpConfigStorePtr clientDelegate_{nullptr};
+    AccStoreServerPtr serverDelegate_{nullptr}; // Only valid on leader node
+
+    std::mutex stateMutex_;
+    std::atomic<bool> isLeader_{false};
+    std::atomic<bool> brokenHandlerRegistered_{false};
+
+    // 当前连接的 leader 地址（与 KEY_LEADER 中原样字符串逐字节一致，避免格式归一化误差）。
+    // leader 进程自连时为自己登记的地址，follower 为所连 leader 的地址。
+    mutable std::mutex lastLeaderMutex_;
+    std::string lastConnectedLeader_;
+
+    // Lifecycle flags
+    std::atomic<bool> stopFlag_{false};
+    std::atomic<bool> reElectionInProgress_{false};
+    std::mutex reElectionThreadMutex_;
+    std::thread reElectionThread_;
+
+    ConfigStoreServerBrokenHandler cachedServerBrokenHandler_{nullptr};
+    LeaderChangeCallback leaderChangeCallback_;
+
+    std::atomic<bool> healthCheckRunning_{false};
+    std::thread healthCheckThread_;
+};
+
+using HaConfigStorePtr = SmRef<HaConfigStore>;
+
+} // namespace smem
+} // namespace ock
+
+#endif

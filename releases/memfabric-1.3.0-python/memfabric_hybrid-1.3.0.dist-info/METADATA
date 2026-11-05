@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: memfabric_hybrid
+Version: 1.3.0
+Summary: python api for memfabric hybrid
+Home-page: https://gitcode.com/Ascend/memfabric_hybrid
+Author: 
+Author-email: 
+License: Mulan PSL v2
+Requires-Python: >=3.10
+Dynamic: home-page
+Dynamic: license
+Dynamic: requires-python
+Dynamic: summary
